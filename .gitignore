@@ -1,0 +1,29 @@
+.env
+__pycache__/
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+
+# Python cache/build
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Notebook/runtime artifacts
+notebooks/output/
+*.log
