@@ -4,7 +4,9 @@ import os
 import json
 import re
 import threading
+import hashlib
 from collections import defaultdict
+from typing import Iterable
 
 from dotenv import load_dotenv
 
@@ -91,6 +93,7 @@ def _hits_to_docs(hits, source: str) -> list[dict]:
         payload = hit.payload or {}
         docs.append(
             {
+                "point_id": str(hit.id),
                 "content": payload.get("content", ""),
                 "heading_path": payload.get("heading_path", ""),
                 "doc_id": payload.get("doc_id", ""),
@@ -102,6 +105,44 @@ def _hits_to_docs(hits, source: str) -> list[dict]:
     return docs
 
 
+def _doc_fusion_key(doc: dict) -> str:
+    """
+    为 RRF 融合生成稳定唯一键，避免仅按 content 去重导致串文档。
+    """
+    doc_id = str(doc.get("doc_id") or "")
+    chunk_index = int(doc.get("chunk_index", -1))
+    if doc_id and chunk_index >= 0:
+        return f"{doc_id}::{chunk_index}"
+
+    point_id = str(doc.get("point_id") or "")
+    if point_id:
+        return f"pid::{point_id}"
+
+    raw = "||".join(
+        [
+            str(doc.get("source") or ""),
+            str(doc.get("heading_path") or ""),
+            str(doc.get("chunk_index", -1)),
+            str(doc.get("content") or ""),
+        ]
+    )
+    return "hash::" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_selected_doc_ids(selected_doc_ids: Iterable[str] | None) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    if selected_doc_ids is None:
+        return ids
+    for raw in selected_doc_ids:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ids.append(value)
+    return ids
+
+
 # ── Step 1：Dense + BM25 + BM42 混合检索 ─────────────────────────────────────
 
 def vector_search(
@@ -109,6 +150,7 @@ def vector_search(
     embedder,  # BaseEmbedder 实例，和入库时保持同一个
     collection_name: str,
     top_k: int = 10,
+    selected_doc_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     在 Qdrant 里做多路检索：
@@ -117,12 +159,23 @@ def vector_search(
       3) sparse bm42（可用时）
     然后用 RRF 融合为一个 vector 结果列表。
     """
-    from qdrant_client.models import Document
+    from qdrant_client.models import Document, FieldCondition, Filter, MatchAny
 
     qdrant = _make_qdrant_client()
     route_info = _collection_route_info(qdrant, collection_name)
     _warn_if_sparse_route_missing(collection_name, route_info)
     candidate_k = top_k * 2
+    scoped_doc_ids = _normalize_selected_doc_ids(selected_doc_ids)
+    query_filter = None
+    if scoped_doc_ids:
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="doc_id",
+                    match=MatchAny(any=scoped_doc_ids),
+                )
+            ]
+        )
 
     dense_vector = embedder.embed([query])[0]
     dense_kwargs = {
@@ -131,6 +184,8 @@ def vector_search(
         "limit": candidate_k,
         "with_payload": True,
     }
+    if query_filter is not None:
+        dense_kwargs["query_filter"] = query_filter
     if route_info["dense_using"] is not None:
         dense_kwargs["using"] = route_info["dense_using"]
     dense_resp = qdrant.query_points(**dense_kwargs)
@@ -146,6 +201,7 @@ def vector_search(
                 using="bm25",
                 limit=candidate_k,
                 with_payload=True,
+                query_filter=query_filter,
             )
             result_lists.append(_hits_to_docs(bm25_resp.points, source="bm25"))
             route_names.append("bm25")
@@ -160,6 +216,7 @@ def vector_search(
                 using="bm42",
                 limit=candidate_k,
                 with_payload=True,
+                query_filter=query_filter,
             )
             result_lists.append(_hits_to_docs(bm42_resp.points, source="bm42"))
             route_names.append("bm42")
@@ -202,6 +259,7 @@ def table_search(
     query: str,
     table_records: list[dict],
     top_k: int = 5,
+    selected_doc_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     在表格 JSON 里做关键词精确匹配（规则检索）。
@@ -213,13 +271,18 @@ def table_search(
     if not query_tokens:
         return []
 
+    scoped_doc_ids = set(_normalize_selected_doc_ids(selected_doc_ids))
     scored = []
     for record in table_records:
+        record_doc_id = str(record.get("_doc_id") or record.get("doc_id") or "")
+        if scoped_doc_ids and record_doc_id not in scoped_doc_ids:
+            continue
+
         record_text = " ".join(str(v) for v in record.values())
         record_tokens = _tokenize(record_text)
         hit_count = len(query_tokens & record_tokens)
         if hit_count > 0:
-            scored.append((hit_count, record))
+            scored.append((hit_count, record_doc_id, record))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -227,12 +290,12 @@ def table_search(
         {
             "content": json.dumps(record, ensure_ascii=False),
             "heading_path": record.get("_source_heading", ""),
-            "doc_id": "",
+            "doc_id": record_doc_id,
             "chunk_index": -1,
             "score": hit_count / len(query_tokens),
             "source": "table",
         }
-        for hit_count, record in scored[:top_k]
+        for hit_count, record_doc_id, record in scored[:top_k]
     ]
 
 
@@ -259,7 +322,7 @@ def reciprocal_rank_fusion(
             else f"route_{route_idx + 1}"
         )
         for rank, doc in enumerate(result_list):
-            key = doc["content"]
+            key = _doc_fusion_key(doc)
             contrib = 1.0 / (k + rank + 1)
             rrf_scores[key] += contrib
             rrf_terms[key].append(
@@ -390,6 +453,7 @@ def hybrid_search(
     collection_name: str,
     table_records: list[dict],
     top_k: int = 5,
+    selected_doc_ids: list[str] | None = None,
 ) -> list[dict]:
     """
     主链路：
@@ -402,8 +466,14 @@ def hybrid_search(
         embedder=embedder,
         collection_name=collection_name,
         top_k=candidate_k,
+        selected_doc_ids=selected_doc_ids,
     )
-    table_results = table_search(query, table_records, top_k=top_k * 2)
+    table_results = table_search(
+        query,
+        table_records,
+        top_k=top_k * 2,
+        selected_doc_ids=selected_doc_ids,
+    )
 
     result_lists = [vector_results]
     route_names = ["vector"]

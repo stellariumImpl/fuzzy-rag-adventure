@@ -300,6 +300,21 @@ def _resolve_sparse_routes(client) -> dict[str, bool]:
     return routes
 
 
+def _delete_existing_doc_points(client, collection_name: str, doc_id: str) -> None:
+    """
+    幂等写入：同一个 doc_id 重跑入库前，先删除旧 points，避免重复累积。
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    client.delete(
+        collection_name=collection_name,
+        points_selector=Filter(
+            must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+        ),
+        wait=True,
+    )
+
+
 def ensure_collection(client, collection_name: str, dimension: int, sparse_routes: dict[str, bool]) -> None:
     """
     确保 Qdrant 中存在指定的 collection。
@@ -326,6 +341,23 @@ def ensure_collection(client, collection_name: str, dimension: int, sparse_route
         )
     else:
         info = client.get_collection(collection_name)
+        vectors_cfg = info.config.params.vectors
+        current_dim = None
+        if isinstance(vectors_cfg, dict):
+            if "dense" in vectors_cfg:
+                current_dim = int(vectors_cfg["dense"].size)
+            elif len(vectors_cfg) == 1:
+                current_dim = int(next(iter(vectors_cfg.values())).size)
+        elif vectors_cfg is not None:
+            current_dim = int(vectors_cfg.size)
+
+        if current_dim is not None and current_dim != int(dimension):
+            raise RuntimeError(
+                f"collection '{collection_name}' 向量维度不匹配: "
+                f"现有={current_dim}, 当前embedder={dimension}。"
+                "请切换同维度 embedder 或删除并重建 collection。"
+            )
+
         existing_sparse = set((info.config.params.sparse_vectors or {}).keys())
         required_sparse = set(sparse_config.keys())
         missing = required_sparse - existing_sparse
@@ -362,6 +394,7 @@ def upsert_chunks(
     sparse_routes = _resolve_sparse_routes(qdrant)
 
     ensure_collection(qdrant, collection_name, embedder.dimension, sparse_routes=sparse_routes)
+    _delete_existing_doc_points(qdrant, collection_name, doc_id)
 
     # 构造用于 embedding 的文本：heading_path 提供上下文，content 提供语义
     texts_to_embed = [

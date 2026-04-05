@@ -23,7 +23,13 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+node_modules/
+frontend/node_modules/
 
 # Notebook/runtime artifacts
 notebooks/output/
 *.log
+upload/
+
+# Backend runtime artifacts
+backend/data/
