@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import random
 import time
 import uuid
@@ -35,8 +36,8 @@ if str(NOTEBOOKS_DIR) not in sys.path:
 from embedding import BGEEmbedder, OpenAIEmbedder  # noqa: E402
 
 
-BM25_MODEL = "Qdrant/bm25"
-BM42_MODEL = "Qdrant/bm42-all-minilm-l6-v2-attentions"
+BM25_MODEL = os.environ.get("BM25_MODEL", "Qdrant/bm25")
+BM42_MODEL = os.environ.get("BM42_MODEL", "Qdrant/bm42-all-minilm-l6-v2-attentions")
 
 
 class STEmbedder:
@@ -252,7 +253,13 @@ def _idcg(relevant_count: int, k: int) -> float:
 
 class QdrantBench:
     def __init__(self, host: str, port: int):
-        self.client = QdrantClient(host=host, port=port, proxy=None, trust_env=False)
+        self.client = QdrantClient(
+            host=host,
+            port=port,
+            proxy=None,
+            trust_env=False,
+            check_compatibility=False,
+        )
 
     def _check_model_available(self, model_name: str) -> bool:
         probe_name = f"_probe_{uuid.uuid4().hex[:8]}"

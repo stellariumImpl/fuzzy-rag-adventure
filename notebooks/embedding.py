@@ -3,10 +3,15 @@ from __future__ import annotations
 import os
 import uuid
 import httpx
+import importlib.util
 from abc import ABC, abstractmethod
 
 from dotenv import load_dotenv
 load_dotenv()
+
+BM25_MODEL = os.environ.get("BM25_MODEL", "Qdrant/bm25")
+BM42_MODEL = os.environ.get("BM42_MODEL", "Qdrant/bm42-all-minilm-l6-v2-attentions")
+_SPARSE_MODEL_SUPPORT_CACHE: dict[str, bool] = {}
 
 # ── 可插拔 Embedding 接口 ──────────────────────────────────────────────────────
 #
@@ -98,18 +103,53 @@ class BGEEmbedder(BaseEmbedder):
     """
 
     def __init__(self, model_name: str = "BAAI/bge-m3"):
-        from FlagEmbedding import BGEM3FlagModel
-        # use_fp16=True 在 GPU 上减半显存占用，CPU 上自动忽略
-        self.model = BGEM3FlagModel(model_name, use_fp16=True)
+        self.backend = "flagembedding"
+        self.model_name = model_name
+
+        # 允许显式强制走 sentence-transformers 兜底后端，规避本地依赖冲突
+        force_st = os.environ.get("BGE_BACKEND", "").lower() == "st"
+
+        if not force_st:
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+
+                # use_fp16=True 在 GPU 上减半显存占用，CPU 上自动忽略
+                self.model = BGEM3FlagModel(model_name, use_fp16=True)
+                return
+            except Exception as e:
+                print(
+                    "警告: FlagEmbedding 初始化失败，将自动回退到 sentence-transformers。"
+                    f" 原因: {type(e).__name__}: {e}"
+                )
+
+        # 兜底方案：使用 sentence-transformers，本地可用性更高
+        # 可通过环境变量 BGE_ST_MODEL 覆盖默认模型
+        from sentence_transformers import SentenceTransformer
+
+        fallback_model = os.environ.get("BGE_ST_MODEL", "BAAI/bge-small-zh-v1.5")
+        self.backend = "sentence-transformers"
+        self.model_name = fallback_model
+        self.model = SentenceTransformer(fallback_model)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        # encode 返回一个字典，dense_vecs 是稠密向量
-        output = self.model.encode(texts, batch_size=12, max_length=8192)
-        return output["dense_vecs"].tolist()
+        if self.backend == "flagembedding":
+            # encode 返回一个字典，dense_vecs 是稠密向量
+            output = self.model.encode(texts, batch_size=12, max_length=8192)
+            return output["dense_vecs"].tolist()
+
+        vectors = self.model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        return vectors.tolist()
 
     @property
     def dimension(self) -> int:
-        return 1024   # bge-m3 的稠密向量维度固定是 1024
+        if self.backend == "flagembedding":
+            return 1024   # bge-m3 的稠密向量维度固定是 1024
+        return int(self.model.get_sentence_embedding_dimension())
 
 
 # ── Embedder 工厂：根据文档语言选择合适的实现 ─────────────────────────────────
@@ -160,25 +200,143 @@ def _make_qdrant_client():
         # trust_env=False 可忽略 HTTP(S)_PROXY 等系统环境变量
         proxy=None,
         trust_env=False,
+        check_compatibility=False,
     )
 
 
-def ensure_collection(client, collection_name: str, dimension: int) -> None:
+def _sparse_route_flags() -> dict[str, bool]:
+    """
+    控制是否启用 BM25/BM42 稀疏向量路由。
+    默认开启 BM25；BM42 需要 fastembed + onnxruntime 环境。
+    """
+    enable_bm25 = os.environ.get("ENABLE_BM25", "1") != "0"
+    enable_bm42 = os.environ.get("ENABLE_BM42", "1") != "0"
+
+    has_fastembed = importlib.util.find_spec("fastembed") is not None
+    has_onnxruntime = importlib.util.find_spec("onnxruntime") is not None
+    bm42_ready = enable_bm42 and has_fastembed and has_onnxruntime
+
+    if enable_bm42 and not bm42_ready:
+        print("警告: BM42 已请求但运行环境未就绪（缺少 fastembed/onnxruntime），将跳过 BM42 入库。")
+
+    return {
+        "bm25": enable_bm25,
+        "bm42": bm42_ready,
+    }
+
+
+def _probe_sparse_model_available(client, model_name: str) -> bool:
+    """
+    用临时 collection 探测 sparse 模型是否可在当前 Qdrant 环境执行。
+    结果做进程内缓存，避免重复探测。
+    """
+    if model_name in _SPARSE_MODEL_SUPPORT_CACHE:
+        return _SPARSE_MODEL_SUPPORT_CACHE[model_name]
+
+    from qdrant_client.models import (
+        Distance,
+        VectorParams,
+        SparseVectorParams,
+        Modifier,
+        PointStruct,
+        Document,
+    )
+
+    probe_name = f"_probe_{uuid.uuid4().hex[:8]}"
+    ok = False
+    try:
+        client.create_collection(
+            collection_name=probe_name,
+            vectors_config=VectorParams(size=3, distance=Distance.COSINE),
+            sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
+        )
+        client.upsert(
+            collection_name=probe_name,
+            points=[
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={
+                        "": [0.1, 0.2, 0.3],
+                        "sparse": Document(text="probe text", model=model_name),
+                    },
+                    payload={"text": "probe text"},
+                )
+            ],
+        )
+        client.query_points(
+            collection_name=probe_name,
+            query=Document(text="probe", model=model_name),
+            using="sparse",
+            limit=1,
+            with_payload=False,
+        )
+        ok = True
+    except Exception:
+        ok = False
+    finally:
+        try:
+            client.delete_collection(probe_name)
+        except Exception:
+            pass
+
+    _SPARSE_MODEL_SUPPORT_CACHE[model_name] = ok
+    return ok
+
+
+def _resolve_sparse_routes(client) -> dict[str, bool]:
+    """
+    在环境开关基础上，进一步探测 BM25/BM42 在当前 Qdrant 的可用性。
+    """
+    routes = _sparse_route_flags()
+
+    if routes["bm25"] and not _probe_sparse_model_available(client, BM25_MODEL):
+        print("警告: BM25 模型在当前 Qdrant 环境不可用，将跳过 BM25 入库。")
+        routes["bm25"] = False
+
+    if routes["bm42"] and not _probe_sparse_model_available(client, BM42_MODEL):
+        print("警告: BM42 模型在当前 Qdrant 环境不可用，将跳过 BM42 入库。")
+        routes["bm42"] = False
+
+    return routes
+
+
+def ensure_collection(client, collection_name: str, dimension: int, sparse_routes: dict[str, bool]) -> None:
     """
     确保 Qdrant 中存在指定的 collection。
     已存在就跳过，不存在就新建，避免重复建库报错。
     """
-    from qdrant_client.models import Distance, VectorParams
+    from qdrant_client.models import Distance, VectorParams, SparseVectorParams, Modifier
 
     existing = {c.name for c in client.get_collections().collections}
+    sparse_config: dict[str, SparseVectorParams] = {}
+    if sparse_routes.get("bm25"):
+        sparse_config["bm25"] = SparseVectorParams(modifier=Modifier.IDF)
+    if sparse_routes.get("bm42"):
+        sparse_config["bm42"] = SparseVectorParams()
+
     if collection_name not in existing:
         client.create_collection(
             collection_name=collection_name,
             vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+            sparse_vectors_config=sparse_config or None,
         )
-        print(f"已创建 collection: {collection_name}，向量维度: {dimension}")
+        print(
+            f"已创建 collection: {collection_name}，向量维度: {dimension}，"
+            f"sparse_routes={list(sparse_config.keys())}"
+        )
     else:
-        print(f"collection 已存在，跳过创建: {collection_name}")
+        info = client.get_collection(collection_name)
+        existing_sparse = set((info.config.params.sparse_vectors or {}).keys())
+        required_sparse = set(sparse_config.keys())
+        missing = required_sparse - existing_sparse
+
+        if missing:
+            raise RuntimeError(
+                f"collection '{collection_name}' 已存在但缺少 sparse 向量配置: {sorted(missing)}。"
+                f"请先删除并重建后再入库，例如："
+                f"qdrant.delete_collection('{collection_name}')"
+            )
+        print(f"collection 已存在，跳过创建: {collection_name}，sparse_routes={sorted(existing_sparse)}")
 
 
 def upsert_chunks(
@@ -198,11 +356,12 @@ def upsert_chunks(
     embedding 时在 content 前面拼上 heading_path，
     让模型知道这段内容"属于哪里"，提升检索准确率。
     """
-    from qdrant_client.models import PointStruct
+    from qdrant_client.models import PointStruct, Document
 
     qdrant = _make_qdrant_client()
+    sparse_routes = _resolve_sparse_routes(qdrant)
 
-    ensure_collection(qdrant, collection_name, embedder.dimension)
+    ensure_collection(qdrant, collection_name, embedder.dimension, sparse_routes=sparse_routes)
 
     # 构造用于 embedding 的文本：heading_path 提供上下文，content 提供语义
     texts_to_embed = [
@@ -213,23 +372,33 @@ def upsert_chunks(
     print(f"正在 embedding {len(chunks)} 个 chunks...")
     vectors = embedder.embed(texts_to_embed)
 
-    points = [
-        PointStruct(
-            id=str(uuid.uuid4()),   # 用 uuid 避免 id 冲突，支持多文档入库
-            vector=vectors[i],
-            payload={
-                "doc_id":       doc_id,
-                "chunk_index":  i,
-                "heading_path": chunks[i]["heading_path"],
-                "content":      chunks[i]["content"],   # 原文，检索后直接返回
-            },
+    points: list[PointStruct] = []
+    for i in range(len(chunks)):
+        vector_map: dict[str, object] = {"": vectors[i]}
+        if sparse_routes.get("bm25"):
+            vector_map["bm25"] = Document(text=texts_to_embed[i], model=BM25_MODEL)
+        if sparse_routes.get("bm42"):
+            vector_map["bm42"] = Document(text=texts_to_embed[i], model=BM42_MODEL)
+
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),   # 用 uuid 避免 id 冲突，支持多文档入库
+                vector=vector_map,
+                payload={
+                    "doc_id":       doc_id,
+                    "chunk_index":  i,
+                    "heading_path": chunks[i]["heading_path"],
+                    "content":      chunks[i]["content"],   # 原文，检索后直接返回
+                },
+            )
         )
-        for i in range(len(chunks))
-    ]
 
     # batch upsert，一次性写入，比逐条写快很多
     qdrant.upsert(collection_name=collection_name, points=points)
-    print(f"已写入 {len(points)} 条向量到 collection: {collection_name}")
+    print(
+        f"已写入 {len(points)} 条向量到 collection: {collection_name}，"
+        f"sparse_routes={[k for k, v in sparse_routes.items() if v]}"
+    )
 
 
 # ── 入口：直接运行这个文件就能完成一次完整的入库 ──────────────────────────────
