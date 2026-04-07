@@ -432,7 +432,7 @@ export function DocumentsView({
 
                 {openMenu?.kind === "document" && openMenu.id === doc.id && (
                   <div
-                    className="absolute right-3 top-full z-50 mt-1 w-[240px] overflow-hidden rounded-xl border border-[#303642] bg-[#111620] shadow-xl"
+                    className="absolute right-3 top-[58px] z-50 w-[240px] overflow-hidden rounded-xl border border-[#303642] bg-[#111620] shadow-xl"
                     onClick={(event) => event.stopPropagation()}
                   >
                     <button

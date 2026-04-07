@@ -849,3 +849,204 @@
     transform: scaleX(0);
   }
 }
+
+/* Light mode patch v2: fill uncovered hard-coded dark classes and
+   keep readable contrast on action-color surfaces. */
+.app-shell[data-theme="light"] .bg-\[\#0c111c\],
+.app-shell[data-theme="light"] .bg-\[\#0f1726\],
+.app-shell[data-theme="light"] .bg-\[\#101722\],
+.app-shell[data-theme="light"] .bg-\[\#111723\],
+.app-shell[data-theme="light"] .bg-\[\#111827\],
+.app-shell[data-theme="light"] .bg-\[\#111927\],
+.app-shell[data-theme="light"] .bg-\[\#121a28\],
+.app-shell[data-theme="light"] .bg-\[\#121b2b\],
+.app-shell[data-theme="light"] .bg-\[\#141b29\],
+.app-shell[data-theme="light"] .bg-\[\#171e2c\],
+.app-shell[data-theme="light"] .bg-\[\#182234\],
+.app-shell[data-theme="light"] .bg-\[\#1a2537\],
+.app-shell[data-theme="light"] .bg-\[\#1c2330\],
+.app-shell[data-theme="light"] .bg-\[\#1c2433\],
+.app-shell[data-theme="light"] .bg-\[\#1c2739\],
+.app-shell[data-theme="light"] .bg-\[\#1f2a3d\],
+.app-shell[data-theme="light"] .bg-\[\#202c40\],
+.app-shell[data-theme="light"] .bg-\[\#222937\],
+.app-shell[data-theme="light"] .bg-\[\#23151a\],
+.app-shell[data-theme="light"] .bg-\[\#232a38\] {
+  background-color: #ffffff !important;
+}
+
+.app-shell[data-theme="light"] .bg-\[\#25344f\],
+.app-shell[data-theme="light"] .bg-\[\#273040\],
+.app-shell[data-theme="light"] .bg-\[\#2c3443\],
+.app-shell[data-theme="light"] .bg-\[\#2d384d\],
+.app-shell[data-theme="light"] .bg-\[\#2e3b51\],
+.app-shell[data-theme="light"] .bg-\[\#2f3a4e\],
+.app-shell[data-theme="light"] .bg-\[\#33465f\],
+.app-shell[data-theme="light"] .bg-\[\#37445a\],
+.app-shell[data-theme="light"] .bg-\[\#394253\],
+.app-shell[data-theme="light"] .bg-\[\#3a4558\],
+.app-shell[data-theme="light"] .bg-\[\#3a455a\],
+.app-shell[data-theme="light"] .bg-\[\#3d4454\],
+.app-shell[data-theme="light"] .bg-\[\#4a5770\],
+.app-shell[data-theme="light"] .bg-\[\#4a5a73\],
+.app-shell[data-theme="light"] .bg-\[\#4a5b79\] {
+  background-color: #e8effa !important;
+}
+
+.app-shell[data-theme="light"] .bg-\[\#d7dee7\],
+.app-shell[data-theme="light"] .bg-\[\#e4e9f2\],
+.app-shell[data-theme="light"] .bg-\[\#e8edf6\],
+.app-shell[data-theme="light"] .bg-\[\#e9edf5\],
+.app-shell[data-theme="light"] .bg-\[\#edf2f8\],
+.app-shell[data-theme="light"] .bg-\[\#f1f4f9\],
+.app-shell[data-theme="light"] .bg-\[\#f5f7fb\],
+.app-shell[data-theme="light"] .bg-\[\#f8f9fd\] {
+  background-color: #f3f7fe !important;
+}
+
+.app-shell[data-theme="light"] .border-\[\#273040\],
+.app-shell[data-theme="light"] .border-\[\#2c3443\],
+.app-shell[data-theme="light"] .border-\[\#2d384d\],
+.app-shell[data-theme="light"] .border-\[\#2e3b51\],
+.app-shell[data-theme="light"] .border-\[\#2f3a4e\],
+.app-shell[data-theme="light"] .border-\[\#37445a\],
+.app-shell[data-theme="light"] .border-\[\#394253\],
+.app-shell[data-theme="light"] .border-\[\#3a455a\],
+.app-shell[data-theme="light"] .border-\[\#4a5770\],
+.app-shell[data-theme="light"] .border-\[\#4a5a73\],
+.app-shell[data-theme="light"] .border-\[\#4a5b79\],
+.app-shell[data-theme="light"] .border-\[\#c8d0df\],
+.app-shell[data-theme="light"] .border-\[\#c8d2e0\],
+.app-shell[data-theme="light"] .border-\[\#d7dce6\],
+.app-shell[data-theme="light"] .border-\[\#d9dee8\],
+.app-shell[data-theme="light"] .border-\[\#dde2eb\] {
+  border-color: #c8d6ea !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#b8bfcc\],
+.app-shell[data-theme="light"] .text-\[\#b8c0cd\],
+.app-shell[data-theme="light"] .text-\[\#c2cfde\],
+.app-shell[data-theme="light"] .text-\[\#c5d1e2\],
+.app-shell[data-theme="light"] .text-\[\#c8d0de\],
+.app-shell[data-theme="light"] .text-\[\#ced7e6\],
+.app-shell[data-theme="light"] .text-\[\#d5dbe8\],
+.app-shell[data-theme="light"] .text-\[\#d8deea\],
+.app-shell[data-theme="light"] .text-\[\#e5ebf5\],
+.app-shell[data-theme="light"] .text-\[\#eaf0ff\],
+.app-shell[data-theme="light"] .text-\[\#f3f7ff\] {
+  color: #5a6b84 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#8ea0ba\],
+.app-shell[data-theme="light"] .text-\[\#8f99ab\],
+.app-shell[data-theme="light"] .text-\[\#90a0b8\],
+.app-shell[data-theme="light"] .text-\[\#93a4be\],
+.app-shell[data-theme="light"] .text-\[\#9aa5b8\],
+.app-shell[data-theme="light"] .text-\[\#9ba7bc\],
+.app-shell[data-theme="light"] .text-\[\#9ba8bc\],
+.app-shell[data-theme="light"] .text-\[\#9ca5b4\],
+.app-shell[data-theme="light"] .text-\[\#9fb0c9\],
+.app-shell[data-theme="light"] .text-\[\#a3adbd\],
+.app-shell[data-theme="light"] .text-\[\#a9b3c5\] {
+  color: #6a7991 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#24344d\],
+.app-shell[data-theme="light"] .text-\[\#33465f\],
+.app-shell[data-theme="light"] .text-\[\#3d4454\],
+.app-shell[data-theme="light"] .text-\[\#1f3048\],
+.app-shell[data-theme="light"] .text-\[\#1a2234\],
+.app-shell[data-theme="light"] .hover\:text-\[\#1a2234\]:hover {
+  color: #203651 !important;
+}
+
+.app-shell[data-theme="light"] .hover\:bg-\[\#182234\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#1a2537\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#1c2330\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#1c2433\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#1c2739\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#1f2a3d\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#232a38\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#e8edf6\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#e9edf5\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#edf2f8\]:hover {
+  background-color: #e8f0fc !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#ff6b6b\],
+.app-shell[data-theme="light"] .text-\[\#ff6b81\],
+.app-shell[data-theme="light"] .text-\[\#ff9a9a\],
+.app-shell[data-theme="light"] .text-\[\#ffb7c5\],
+.app-shell[data-theme="light"] .text-\[\#f2a7a7\],
+.app-shell[data-theme="light"] .text-\[\#e7b3bf\] {
+  color: #b64156 !important;
+}
+
+.app-shell[data-theme="light"] .hover\:text-\[\#ff9a9a\]:hover {
+  color: #a73449 !important;
+}
+
+/* Restore white text on saturated action surfaces in light mode. */
+.app-shell[data-theme="light"] .bg-\[\#4A90D9\],
+.app-shell[data-theme="light"] .bg-\[\#3f82c8\],
+.app-shell[data-theme="light"] .bg-\[\#3f82c9\],
+.app-shell[data-theme="light"] .bg-\[\#3b81ca\],
+.app-shell[data-theme="light"] .bg-\[\#3c84cf\],
+.app-shell[data-theme="light"] .bg-\[\#4a90d9\],
+.app-shell[data-theme="light"] .bg-\[\#c24157\],
+.app-shell[data-theme="light"] .bg-\[\#cc5c67\],
+.app-shell[data-theme="light"] .bg-\[\#a43448\],
+.app-shell[data-theme="light"] .bg-\[\#267e62\],
+.app-shell[data-theme="light"] .bg-\[\#2c8f6f\],
+.app-shell[data-theme="light"] .bg-\[\#56a37a\] {
+  color: #ffffff !important;
+}
+
+.app-shell[data-theme="light"] .bg-\[\#3a1720\],
+.app-shell[data-theme="light"] .bg-\[\#6f2c3b\] {
+  background-color: #ffeef2 !important;
+}
+
+.app-shell[data-theme="light"] .bg-\[\#cc9a5c\] {
+  background-color: #f3e5cf !important;
+  color: #79501f !important;
+}
+
+.app-shell[data-theme="light"] .border-\[\#3f2730\],
+.app-shell[data-theme="light"] .border-\[\#55313a\],
+.app-shell[data-theme="light"] .border-\[\#6a2a37\] {
+  border-color: #dfb2bc !important;
+}
+
+.app-shell[data-theme="light"] .border-\[\#9cb0ca\],
+.app-shell[data-theme="light"] .border-\[\#cc9a5c\] {
+  border-color: #bfd0e7 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#4f9c73\] {
+  color: #2f7f57 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#51617b\],
+.app-shell[data-theme="light"] .text-\[\#66758d\],
+.app-shell[data-theme="light"] .text-\[\#6f7686\],
+.app-shell[data-theme="light"] .text-\[\#7f8ba1\],
+.app-shell[data-theme="light"] .text-\[\#8b97ab\],
+.app-shell[data-theme="light"] .text-\[\#b5c2d7\],
+.app-shell[data-theme="light"] .text-\[\#c0c7d4\],
+.app-shell[data-theme="light"] .text-\[\#e8edf7\] {
+  color: #63748c !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#9dc1e8\],
+.app-shell[data-theme="light"] .text-\[\#b9d3ff\] {
+  color: #2f72c7 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#be8a48\] {
+  color: #91612b !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#d86873\] {
+  color: #b64156 !important;
+}

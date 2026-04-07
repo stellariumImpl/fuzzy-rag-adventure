@@ -6,7 +6,7 @@ import re
 import threading
 import hashlib
 from collections import defaultdict
-from typing import Iterable
+from typing import Any, Iterable
 
 from dotenv import load_dotenv
 
@@ -16,10 +16,15 @@ BM25_MODEL = os.environ.get("BM25_MODEL", "Qdrant/bm25")
 BM42_MODEL = os.environ.get("BM42_MODEL", "Qdrant/bm42-all-minilm-l6-v2-attentions")
 DEFAULT_RERANKER_MODEL_EN = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANKER_MODEL_ZH = "BAAI/bge-reranker-v2-m3"
+DEFAULT_MULTI_QUERY_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
 
 _RERANKERS: dict[str, "_CrossEncoderReranker"] = {}
 _RERANKER_LOCK = threading.Lock()
 _ROUTE_WARNED: set[str] = set()
+_MULTI_QUERY_CLIENT: Any | None = None
+_MULTI_QUERY_CLIENT_LOCK = threading.Lock()
+_MULTI_QUERY_CACHE: dict[str, list[str]] = {}
+_MULTI_QUERY_CACHE_LOCK = threading.Lock()
 
 
 # ── Qdrant 客户端（绕过系统代理，和 embedding.py 保持一致）──────────────────
@@ -141,6 +146,195 @@ def _normalize_selected_doc_ids(selected_doc_ids: Iterable[str] | None) -> list[
         seen.add(value)
         ids.append(value)
     return ids
+
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except Exception:
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+def _multi_query_enabled() -> bool:
+    return os.environ.get("ENABLE_MULTI_QUERY", "1") != "0"
+
+
+def _multi_query_count() -> int:
+    return _env_int("MULTI_QUERY_COUNT", default=4, min_value=1, max_value=5)
+
+
+def _compact_query_label(text: str, max_len: int = 20) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "").strip())
+    if len(compact) <= max_len:
+        return compact
+    return compact[:max_len].rstrip() + "..."
+
+
+def _normalize_query_variants(base_query: str, candidates: Iterable[str], limit: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        q = re.sub(r"\s+", " ", str(raw or "").strip())
+        if not q:
+            return
+        key = q.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(q)
+
+    _add(base_query)
+    for c in candidates:
+        _add(c)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _extract_queries_from_llm_text(raw: str) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+
+    # 优先按 JSON 解析（模型按提示应返回 JSON 数组）
+    candidates_to_try = [text]
+    m = re.search(r"\[[\s\S]*\]", text)
+    if m:
+        candidates_to_try.insert(0, m.group(0))
+
+    for candidate in candidates_to_try:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+    # 兜底：逐行解析
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    cleaned: list[str] = []
+    for line in lines:
+        line = re.sub(r"^\s*[-*•]+\s*", "", line)
+        line = re.sub(r"^\s*\d+[\.\)\-:：]\s*", "", line)
+        line = line.strip().strip("\"'`")
+        if line:
+            cleaned.append(line)
+    return cleaned
+
+
+def _get_multi_query_client():
+    global _MULTI_QUERY_CLIENT
+    if _MULTI_QUERY_CLIENT is not None:
+        return _MULTI_QUERY_CLIENT
+
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        return None
+
+    with _MULTI_QUERY_CLIENT_LOCK:
+        if _MULTI_QUERY_CLIENT is not None:
+            return _MULTI_QUERY_CLIENT
+        try:
+            from openai import OpenAI
+
+            _MULTI_QUERY_CLIENT = OpenAI(
+                api_key=api_key,
+                base_url=os.environ.get("LLM_BASE_URL") or None,
+            )
+            return _MULTI_QUERY_CLIENT
+        except Exception as e:
+            print(f"警告: Multi Query 客户端初始化失败，已回退单查询。原因: {type(e).__name__}: {e}")
+            return None
+
+
+def _generate_multi_queries(query: str, total_count: int) -> list[str]:
+    query = str(query or "").strip()
+    if not query:
+        return []
+    if total_count <= 1:
+        return [query]
+
+    client = _get_multi_query_client()
+    if client is None:
+        return [query]
+
+    extra_count = max(1, total_count - 1)
+    model = os.environ.get("MULTI_QUERY_MODEL", DEFAULT_MULTI_QUERY_MODEL)
+    temperature = float(os.environ.get("MULTI_QUERY_TEMPERATURE", "0.2"))
+
+    if _contains_cjk(query):
+        system_prompt = (
+            "你是检索查询改写助手。"
+            "请输出多个语义等价但表述不同的检索查询，用于提升召回。"
+            "只输出 JSON 数组，不要解释。"
+        )
+        user_prompt = (
+            f"原问题：{query}\n"
+            f"请生成 {extra_count} 条不同表达的检索查询。\n"
+            "要求：保持原意，不引入新事实；尽量覆盖同义词、简称、上下位词。\n"
+            "输出格式示例：\n"
+            '["改写1", "改写2"]'
+        )
+    else:
+        system_prompt = (
+            "You are a retrieval query rewriter. "
+            "Generate semantically equivalent query variants for better recall. "
+            "Output JSON array only."
+        )
+        user_prompt = (
+            f"Original question: {query}\n"
+            f"Generate {extra_count} alternative retrieval queries.\n"
+            "Keep intent unchanged and avoid adding new facts.\n"
+            'Return JSON array only, e.g. ["q1","q2"].'
+        )
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=220,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        generated = _extract_queries_from_llm_text(content)
+        variants = _normalize_query_variants(query, generated, limit=total_count)
+        return variants or [query]
+    except Exception as e:
+        print(f"警告: Multi Query 生成失败，已回退单查询。原因: {type(e).__name__}: {e}")
+        return [query]
+
+
+def build_query_variants(query: str) -> list[str]:
+    """
+    生成查询变体（Multi Query），失败时自动退化为 [query]。
+    """
+    base_query = str(query or "").strip()
+    if not base_query:
+        return []
+    if not _multi_query_enabled():
+        return [base_query]
+
+    total_count = _multi_query_count()
+    cache_key = f"{total_count}::{base_query}"
+    with _MULTI_QUERY_CACHE_LOCK:
+        cached = _MULTI_QUERY_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
+    variants = _generate_multi_queries(base_query, total_count=total_count)
+    variants = _normalize_query_variants(base_query, variants, limit=total_count)
+    if not variants:
+        variants = [base_query]
+
+    with _MULTI_QUERY_CACHE_LOCK:
+        _MULTI_QUERY_CACHE[cache_key] = variants
+    return variants
 
 
 # ── Step 1：Dense + BM25 + BM42 混合检索 ─────────────────────────────────────
@@ -332,7 +526,17 @@ def reciprocal_rank_fusion(
                     "contrib": round(contrib, 6),
                 }
             )
-            doc_store[key] = doc
+            if key not in doc_store:
+                doc_store[key] = doc.copy()
+            else:
+                existing = doc_store[key]
+                existing_detail = existing.get("score_detail") or {}
+                incoming_detail = doc.get("score_detail") or {}
+                for d_key, d_value in incoming_detail.items():
+                    if d_key not in existing_detail:
+                        existing_detail[d_key] = d_value
+                if existing_detail:
+                    existing["score_detail"] = existing_detail
 
     sorted_keys = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
 
@@ -445,22 +649,21 @@ def rerank_with_model(query: str, results: list[dict], top_k: int = 5) -> list[d
     return scored[:top_k]
 
 
-# ── 对外接口：三路融合检索 + 模型重排 ────────────────────────────────────────
+# ── 对外接口：Multi Query + RAG-Fusion + 模型重排 ───────────────────────────
 
-def hybrid_search(
+def _single_query_recall(
     query: str,
     embedder,
     collection_name: str,
     table_records: list[dict],
-    top_k: int = 5,
-    selected_doc_ids: list[str] | None = None,
+    candidate_k: int,
+    top_k: int,
+    selected_doc_ids: list[str] | None,
 ) -> list[dict]:
     """
-    主链路：
-      dense/bm25/bm42 多路召回 -> RRF 融合 -> cross-encoder 重排。
+    单个查询的召回流程：
+      vector(dense/bm25/bm42) + table -> RRF 融合。
     """
-    candidate_k = max(top_k * 6, 20)
-
     vector_results = vector_search(
         query=query,
         embedder=embedder,
@@ -471,7 +674,7 @@ def hybrid_search(
     table_results = table_search(
         query,
         table_records,
-        top_k=top_k * 2,
+        top_k=max(top_k * 2, 10),
         selected_doc_ids=selected_doc_ids,
     )
 
@@ -487,8 +690,84 @@ def hybrid_search(
         route_names=route_names,
         detail_key="fusion_rrf_terms",
     )
+    return fused
 
-    return rerank_with_model(query=query, results=fused, top_k=top_k)
+
+def hybrid_search(
+    query: str,
+    embedder,
+    collection_name: str,
+    table_records: list[dict],
+    top_k: int = 5,
+    selected_doc_ids: list[str] | None = None,
+) -> list[dict]:
+    """
+    主链路：
+      1) Multi Query（可关闭/失败自动降级为单查询）
+      2) 每个查询执行 vector+table 召回并做 RRF
+      3) RAG-Fusion：跨查询做 RRF 融合
+      4) 用原始问题做 cross-encoder 重排
+    """
+    candidate_k = max(top_k * 6, 20)
+    query_variants = build_query_variants(query)
+    if not query_variants:
+        query_variants = [query]
+
+    # 单查询模式：保持与历史流程一致
+    if len(query_variants) == 1:
+        fused = _single_query_recall(
+            query=query,
+            embedder=embedder,
+            collection_name=collection_name,
+            table_records=table_records,
+            candidate_k=candidate_k,
+            top_k=top_k,
+            selected_doc_ids=selected_doc_ids,
+        )
+    else:
+        per_query_lists: list[list[dict]] = []
+        route_names: list[str] = []
+
+        for idx, query_variant in enumerate(query_variants):
+            recalled = _single_query_recall(
+                query=query_variant,
+                embedder=embedder,
+                collection_name=collection_name,
+                table_records=table_records,
+                candidate_k=candidate_k,
+                top_k=top_k,
+                selected_doc_ids=selected_doc_ids,
+            )
+            if not recalled:
+                continue
+            for item in recalled:
+                score_detail = item.get("score_detail") or {}
+                score_detail["expanded_query"] = query_variant
+                item["score_detail"] = score_detail
+            per_query_lists.append(recalled)
+            route_names.append(f"mq{idx + 1}:{_compact_query_label(query_variant)}")
+
+        if not per_query_lists:
+            fused = []
+        elif len(per_query_lists) == 1:
+            fused = per_query_lists[0]
+        else:
+            fused = reciprocal_rank_fusion(
+                result_lists=per_query_lists,
+                top_k=candidate_k,
+                route_names=route_names,
+                detail_key="multi_query_rrf_terms",
+            )
+            for item in fused:
+                item["source"] = "rag_fusion"
+
+    reranked = rerank_with_model(query=query, results=fused, top_k=top_k)
+    for item in reranked:
+        score_detail = item.get("score_detail") or {}
+        score_detail["query_variants"] = query_variants
+        score_detail["query_variant_count"] = len(query_variants)
+        item["score_detail"] = score_detail
+    return reranked
 
 
 # ── 打印检索结果，调试用 ──────────────────────────────────────────────────────
@@ -517,6 +796,18 @@ def print_results(results: list[dict]) -> None:
                 for t in vector_terms
             )
             print(f"RRF构成(向量内部): {vector_text}")
+
+        multi_query_terms = (r.get("score_detail") or {}).get("multi_query_rrf_terms", [])
+        if multi_query_terms:
+            mq_text = " + ".join(
+                f"{t['route']}@rank{t['rank']}:{t['contrib']}"
+                for t in multi_query_terms
+            )
+            print(f"RRF构成(MultiQuery融合): {mq_text}")
+
+        query_variants = (r.get("score_detail") or {}).get("query_variants", [])
+        if query_variants:
+            print("查询改写: " + " | ".join(str(q) for q in query_variants))
 
         reranker_model = (r.get("score_detail") or {}).get("reranker_model")
         if reranker_model:
