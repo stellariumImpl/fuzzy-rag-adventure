@@ -36,6 +36,7 @@ const safeJson = (value: unknown): string => {
 
 const normalizeStageName = (rawStage: string): string => {
   const stage = rawStage.trim().toLowerCase();
+  if (stage === "retrieve") return "retrieval";
   if (stage === "notebook-recursive" || stage === "recursive-rag") return "retrieval";
   return rawStage;
 };
@@ -107,7 +108,10 @@ export function ThinkingPanel({ debug, isStreaming }: ThinkingPanelProps) {
   }, [completedAt, startedAt, isStreaming, events.length]);
 
   const done = !isStreaming;
-  const summaryText = done ? `Thought for ${formatSeconds(elapsedMs)}` : "Thinking…";
+  const hasEvents = events.length > 0;
+  const summaryText = done
+    ? `Retrieval log · ${formatSeconds(elapsedMs)}`
+    : "Running retrieval pipeline…";
 
   const maybeScrollBottom = () => {
     const body = bodyRef.current;
@@ -224,6 +228,11 @@ export function ThinkingPanel({ debug, isStreaming }: ThinkingPanelProps) {
     };
   }, []);
 
+  // Keep hooks unconditional; hide panel only after all hooks are declared.
+  if (!hasEvents) {
+    return null;
+  }
+
   return (
     <details
       ref={detailsRef}
@@ -235,7 +244,7 @@ export function ThinkingPanel({ debug, isStreaming }: ThinkingPanelProps) {
       className="mb-2"
     >
       <summary
-        aria-label="Toggle thinking process"
+        aria-label="Toggle retrieval log"
         className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-semibold text-[#9dc1e8]"
       >
         <SpinnerOrCheck done={done} />
@@ -246,7 +255,7 @@ export function ThinkingPanel({ debug, isStreaming }: ThinkingPanelProps) {
         ref={bodyRef}
         role="log"
         aria-live="polite"
-        aria-label="Thinking process"
+        aria-label="Retrieval pipeline log"
         onScroll={(event) => {
           const el = event.currentTarget;
           const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;

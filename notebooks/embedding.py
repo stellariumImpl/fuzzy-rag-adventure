@@ -60,10 +60,24 @@ class OpenAIEmbedder(BaseEmbedder):
         # 如需代理，请显式设置 LLM_HTTP_PROXY，例如：http://127.0.0.1:7890
         proxy = os.environ.get("LLM_HTTP_PROXY") or None
         timeout = float(os.environ.get("LLM_TIMEOUT", "60"))
+        api_key = (
+            os.environ.get("EMBEDDING_API_KEY")
+            or os.environ.get("LLM_API_KEY")
+            or ""
+        ).strip()
+        base_url = (
+            os.environ.get("EMBEDDING_BASE_URL")
+            or os.environ.get("LLM_BASE_URL")
+            or None
+        )
+        if not api_key:
+            raise RuntimeError(
+                "Missing EMBEDDING_API_KEY/LLM_API_KEY for OpenAI embedding."
+            )
 
         self.client = OpenAI(
-            api_key=os.environ["LLM_API_KEY"],
-            base_url=os.environ.get("LLM_BASE_URL") or None,
+            api_key=api_key,
+            base_url=base_url,
             http_client=httpx.Client(
                 proxy=proxy,
                 trust_env=False,
@@ -82,7 +96,7 @@ class OpenAIEmbedder(BaseEmbedder):
             raise RuntimeError(
                 "OpenAI embedding 连接失败。请检查："
                 "1) 外网连通性；"
-                "2) LLM_BASE_URL 是否可达；"
+                "2) EMBEDDING_BASE_URL/LLM_BASE_URL 是否可达；"
                 "3) 若需要代理请设置 LLM_HTTP_PROXY，"
                 "否则保持未设置以直连。"
                 f" 原始错误: {type(e).__name__}: {e}"
@@ -395,6 +409,12 @@ def upsert_chunks(
 
     ensure_collection(qdrant, collection_name, embedder.dimension, sparse_routes=sparse_routes)
     _delete_existing_doc_points(qdrant, collection_name, doc_id)
+
+    # Some PDFs may yield zero text chunks after parsing/normalization.
+    # Qdrant rejects empty upsert payloads; treat this as a valid no-op.
+    if not chunks:
+        print(f"文档 {doc_id} 没有可入库 text chunks，跳过向量写入。")
+        return
 
     # 构造用于 embedding 的文本：heading_path 提供上下文，content 提供语义
     texts_to_embed = [

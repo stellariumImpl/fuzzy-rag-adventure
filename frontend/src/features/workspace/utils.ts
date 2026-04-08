@@ -61,7 +61,7 @@ export const getDocumentStatusLabel = (status: string): string => {
   if (value === "deleting") return "Deleting";
   if (value === "uploaded_only") return "Uploaded only";
   if (value === "uploaded") return "Uploaded";
-  if (value === "failed") return "Parse failed";
+  if (value === "failed") return "Ingest failed";
   if (value === "ready") return "Ready";
   return "Unavailable";
 };

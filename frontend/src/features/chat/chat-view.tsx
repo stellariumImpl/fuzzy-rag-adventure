@@ -235,17 +235,17 @@ export function ChatView({
             </div>
           )
         ) : (
-          <div className="flex min-h-full flex-col gap-4 pr-1">
+          <div className="mx-auto flex min-h-full w-full max-w-[980px] flex-col gap-4 pr-1">
             {messages.map((message) => (
               <div
                 key={message.id}
                 className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
-                  className={`max-w-[70%] whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm leading-6 ${
+                  className={`whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm leading-6 ${
                     message.role === "user"
-                      ? "bg-[#2a2a2a] text-white"
-                      : "bg-[#1a1a1a] text-[#d9dce3]"
+                      ? "max-w-[72%] bg-[#2a2a2a] text-white"
+                      : "max-w-full bg-[#1a1a1a] text-[#d9dce3]"
                   }`}
                 >
                   {message.role === "assistant" && message.debug && (

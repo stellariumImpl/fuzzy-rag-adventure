@@ -34,6 +34,14 @@ Open: [http://127.0.0.1:5173](http://127.0.0.1:5173)
 - Vite proxy forwards `/api/*` to `http://127.0.0.1:8000/*`
 - Endpoints used by UI:
   - `GET /health`
+  - `GET /settings/providers/assistant`
+  - `GET /settings/providers/embedding`
+  - `GET /settings/assistant`
+  - `PATCH /settings/assistant`
+  - `POST /settings/assistant/test`
+  - `GET /settings/assistant/retrieval-status`
+  - `GET /settings/llamaparse`
+  - `PATCH /settings/llamaparse`
   - `POST /upload`
   - `GET /documents`
   - `PATCH /documents/{doc_id}`

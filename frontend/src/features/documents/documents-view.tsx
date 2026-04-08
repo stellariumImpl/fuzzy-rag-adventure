@@ -396,9 +396,9 @@ export function DocumentsView({
                 className="group relative rounded-2xl border border-[#262d3a] bg-[#171c27] p-4"
               >
                 <div className="mb-3 flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex items-center gap-3">
-                    <FileText size={19} className="text-[#b8bec9]" />
-                    <div className="min-w-0">
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <FileText size={19} className="flex-shrink-0 text-[#b8bec9]" />
+                    <div className="min-w-0 flex-1">
                       <p className="truncate text-[1.1rem] font-semibold text-white">{doc.name}</p>
                       <div className="mt-1">
                         <DocumentStatusBadge status={doc.status} />
@@ -583,15 +583,17 @@ export function DocumentsView({
                   }`}
                 >
                   <div className="min-w-0 flex-1 pr-3 sm:pr-6">
-                    <div className="mb-2 flex items-center gap-4">
+                    <div className="mb-2 flex min-w-0 items-center gap-4">
                       <FileText
                         size={isMobileViewport ? 21 : 24}
                         className="flex-shrink-0 text-[#b8bec9]"
                       />
-                      <span className="truncate text-base font-semibold text-white sm:text-lg">
+                      <span className="min-w-0 flex-1 truncate text-base font-semibold text-white sm:text-lg">
                         {doc.name}
                       </span>
-                      <DocumentStatusBadge status={doc.status} />
+                      <div className="flex-shrink-0">
+                        <DocumentStatusBadge status={doc.status} />
+                      </div>
                     </div>
                     <p className="ml-8 line-clamp-1 text-xs text-[#a5acb8] sm:ml-10 sm:text-sm">
                       {getDocumentDescriptionLabel(doc.description)}

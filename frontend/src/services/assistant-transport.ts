@@ -110,6 +110,7 @@ function buildRecallPreview(
   const preview = rows.slice(0, 6).map((row, idx) => ({
     rank: idx + 1,
     doc_id: String(row.doc_id ?? ""),
+    source_name: String(row.source_name ?? row.doc_id ?? ""),
     heading_path: String(row.heading_path ?? ""),
     source: String(row.source ?? ""),
     chunk_index: typeof row.chunk_index === "number" ? row.chunk_index : toNumberOrNull(row.chunk_index),
@@ -135,11 +136,13 @@ function buildCitations(
     const idxRaw = Number(src?.index);
     const index = Number.isFinite(idxRaw) && idxRaw > 0 ? idxRaw : i + 1;
     const hit = rows[index - 1] ?? {};
+    const docId = String(src?.doc_id ?? hit?.doc_id ?? "");
+    const sourceName = String(src?.source_name ?? hit?.source_name ?? docId);
     return {
       index,
       heading_path: String(src?.heading_path ?? hit?.heading_path ?? ""),
-      doc_id: String(hit?.doc_id ?? ""),
-      source_name: String(hit?.doc_id ?? ""),
+      doc_id: docId,
+      source_name: sourceName,
       source_type: String(src?.source_type ?? hit?.source ?? ""),
       chunk_index:
         typeof hit?.chunk_index === "number" ? hit.chunk_index : toNumberOrNull(hit?.chunk_index) ?? -1,
@@ -158,6 +161,7 @@ export const requestAssistantReply = async (
 ): Promise<AssistantReplyResult> => {
   const startedAt = Date.now();
   const selectedDocIds = options?.selectedDocIds ?? [];
+  const collectedDebugEvents: AssistantDebugEvent[] = [];
 
   onStreamEvent?.({ type: "ready" });
 
@@ -187,9 +191,11 @@ export const requestAssistantReply = async (
   const recallPreview = buildRecallPreview(data.retrieval_results);
   const citations = buildCitations(data.sources, data.retrieval_results);
 
+  const retrievalEvent = newDebugEvent("retrieval", "Top recalled chunks", recallPreview);
+  collectedDebugEvents.push(retrievalEvent);
   onStreamEvent?.({
     type: "debug",
-    event: newDebugEvent("retrieve", "Top recalled chunks", recallPreview),
+    event: retrievalEvent,
   });
 
   const answerText = (data.answer || "").trim() || "No answer returned.";
@@ -203,7 +209,7 @@ export const requestAssistantReply = async (
     startedAt,
     completedAt: Date.now(),
     statusText: "completed",
-    events: [],
+    events: collectedDebugEvents,
   };
 
   await appendChatMessages(

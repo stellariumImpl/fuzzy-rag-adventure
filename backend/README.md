@@ -5,6 +5,14 @@ This backend wraps the existing notebook pipeline into stable API endpoints.
 ## Endpoints
 
 - `GET /health`
+- `GET /settings/providers/assistant`
+- `GET /settings/providers/embedding`
+- `GET /settings/assistant`
+- `PATCH /settings/assistant`
+- `POST /settings/assistant/test`
+- `GET /settings/assistant/retrieval-status`
+- `GET /settings/llamaparse`
+- `PATCH /settings/llamaparse`
 - `POST /ingest`
 - `POST /upload` (multipart file upload)
 - `GET /documents`

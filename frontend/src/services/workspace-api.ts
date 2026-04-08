@@ -6,9 +6,6 @@ const RAG_DOC_LANGUAGE = import.meta.env.VITE_RAG_DOC_LANGUAGE ?? "mixed";
 
 const FOLDERS_KEY = "powerful-rag-ui-folders-v1";
 const CHATS_KEY = "powerful-rag-ui-chats-v1";
-const ASSISTANT_SETTINGS_KEY = "powerful-rag-ui-assistant-settings-v1";
-const LLAMA_PARSE_SETTINGS_KEY = "powerful-rag-ui-llamaparse-settings-v1";
-const OCR_SETTINGS_KEY = "powerful-rag-ui-ocr-settings-v1";
 
 export type WorkspaceFolder = {
   folder_id: string;
@@ -165,26 +162,9 @@ export type LlamaParseSettings = {
   user_id: string;
   enabled: boolean;
   base_url: string;
-  target_pages: string;
-  result_type: string;
-  split_by_page: boolean;
-  api_key_configured: boolean;
-  api_key_preview: string;
-  created_at: string;
-  updated_at: string;
-};
-
-export type MultimodalOCRSettings = {
-  user_id: string;
-  enabled: boolean;
-  provider: string;
   model: string;
-  api_base: string;
   api_key_configured: boolean;
   api_key_preview: string;
-  max_pages_per_doc: number;
-  strategy: "fallback" | "prefer_ocr" | "hybrid";
-  prompt: string;
   created_at: string;
   updated_at: string;
 };
@@ -361,20 +341,7 @@ type UpdateLlamaParseSettingsPayload = {
   enabled?: boolean;
   api_key?: string;
   base_url?: string;
-  target_pages?: string;
-  result_type?: string;
-  split_by_page?: boolean;
-};
-
-type UpdateMultimodalOCRSettingsPayload = {
-  enabled?: boolean;
-  provider?: string;
   model?: string;
-  api_base?: string;
-  api_key?: string;
-  max_pages_per_doc?: number;
-  strategy?: "fallback" | "prefer_ocr" | "hybrid";
-  prompt?: string;
 };
 
 type UploadApiResponse = {
@@ -466,99 +433,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined as T;
   }
   return JSON.parse(text) as T;
-}
-
-function defaultAssistantProviders(): AssistantProviderOption[] {
-  return [
-    {
-      provider: "openai-compatible",
-      label: "OpenAI Compatible",
-      default_model: "gpt-4o",
-      default_api_base: "https://api.openai.com/v1",
-      requires_api_key: true,
-    },
-    {
-      provider: "dashscope",
-      label: "DashScope",
-      default_model: "qwen-max",
-      default_api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      requires_api_key: true,
-    },
-  ];
-}
-
-function defaultEmbeddingProviders(): AssistantProviderOption[] {
-  return [
-    {
-      provider: "bge",
-      label: "BGE Local",
-      default_model: "BAAI/bge-m3",
-      default_api_base: "local",
-      requires_api_key: false,
-    },
-    {
-      provider: "openai-compatible",
-      label: "OpenAI Compatible",
-      default_model: "text-embedding-3-small",
-      default_api_base: "https://api.openai.com/v1",
-      requires_api_key: true,
-    },
-  ];
-}
-
-function defaultAssistantSettings(): AssistantSettings {
-  const now = nowIso();
-  return {
-    user_id: "local-user",
-    llm_provider: "openai-compatible",
-    llm_model: "gpt-4o",
-    api_base: "https://api.openai.com/v1",
-    api_key_configured: false,
-    api_key_preview: "",
-    temperature: 0.2,
-    max_tokens: 512,
-    embedding_provider: "bge",
-    embedding_model: "BAAI/bge-m3",
-    embedding_api_base: "local",
-    embedding_api_key_configured: false,
-    embedding_api_key_preview: "",
-    created_at: now,
-    updated_at: now,
-  };
-}
-
-function defaultLlamaParseSettings(): LlamaParseSettings {
-  const now = nowIso();
-  return {
-    user_id: "local-user",
-    enabled: false,
-    base_url: "https://api.cloud.llamaindex.ai",
-    target_pages: "",
-    result_type: "markdown",
-    split_by_page: true,
-    api_key_configured: false,
-    api_key_preview: "",
-    created_at: now,
-    updated_at: now,
-  };
-}
-
-function defaultOCRSettings(): MultimodalOCRSettings {
-  const now = nowIso();
-  return {
-    user_id: "local-user",
-    enabled: false,
-    provider: "openai-compatible",
-    model: "gpt-4o-mini",
-    api_base: "https://api.openai.com/v1",
-    api_key_configured: false,
-    api_key_preview: "",
-    max_pages_per_doc: 8,
-    strategy: "hybrid",
-    prompt: "",
-    created_at: now,
-    updated_at: now,
-  };
 }
 
 function readFolders(): WorkspaceFolder[] {
@@ -1012,45 +886,55 @@ export async function runDocumentRetrievalTest(
 }
 
 export async function getAssistantSettings(
-  _options?:
+  options?:
     | string
     | {
         llmProvider?: string;
         embeddingProvider?: string;
       },
 ) {
-  return readLocal<AssistantSettings>(ASSISTANT_SETTINGS_KEY, defaultAssistantSettings());
+  const query = new URLSearchParams();
+  if (typeof options === "string") {
+    if (options.trim()) {
+      query.set("llm_provider", options.trim());
+    }
+  } else if (options) {
+    if (options.llmProvider?.trim()) {
+      query.set("llm_provider", options.llmProvider.trim());
+    }
+    if (options.embeddingProvider?.trim()) {
+      query.set("embedding_provider", options.embeddingProvider.trim());
+    }
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  return request<AssistantSettings>(`/settings/assistant${suffix}`);
 }
 
 export function listAssistantProviders() {
-  return Promise.resolve<AssistantProviderList>({ items: defaultAssistantProviders() });
+  return request<AssistantProviderList>("/settings/providers/assistant");
 }
 
 export function listEmbeddingProviders() {
-  return Promise.resolve<AssistantProviderList>({ items: defaultEmbeddingProviders() });
+  return request<AssistantProviderList>("/settings/providers/embedding");
 }
 
 export async function getAssistantRetrievalStatus() {
-  const docs = await fetchDocumentListFromBackend();
-  const readyCount = docs.filter((doc) => doc.status === "ready").length;
-  const settings = await getAssistantSettings();
-  return {
-    mode: "hybrid",
-    reasons: [],
-    llm_provider: settings.llm_provider,
-    llm_model: settings.llm_model,
-    llm_api_key_configured: settings.api_key_configured,
-    embedding_provider: settings.embedding_provider,
-    embedding_model: settings.embedding_model,
-    embedding_api_key_configured: settings.embedding_api_key_configured,
-    ready_document_count: readyCount,
-  } as RetrievalPipelineStatus;
+  return request<RetrievalPipelineStatus>("/settings/assistant/retrieval-status");
 }
 
 export async function updateAssistantSettings(payload: UpdateAssistantSettingsPayload) {
-  const current = await getAssistantSettings();
-  const next: AssistantSettings = {
-    ...current,
+  const body: {
+    llm_provider?: string;
+    llm_model?: string;
+    api_base?: string;
+    api_key?: string;
+    temperature?: number;
+    max_tokens?: number;
+    embedding_provider?: string;
+    embedding_model?: string;
+    embedding_api_base?: string;
+    embedding_api_key?: string;
+  } = {
     ...(payload.llm_provider ? { llm_provider: payload.llm_provider } : {}),
     ...(payload.llm_model ? { llm_model: payload.llm_model } : {}),
     ...(payload.api_base ? { api_base: payload.api_base } : {}),
@@ -1059,114 +943,55 @@ export async function updateAssistantSettings(payload: UpdateAssistantSettingsPa
     ...(payload.embedding_provider ? { embedding_provider: payload.embedding_provider } : {}),
     ...(payload.embedding_model ? { embedding_model: payload.embedding_model } : {}),
     ...(payload.embedding_api_base ? { embedding_api_base: payload.embedding_api_base } : {}),
-    ...(payload.api_key !== undefined
-      ? {
-          api_key_configured: payload.api_key.trim().length > 0,
-          api_key_preview: payload.api_key.trim().length > 0 ? "****" : "",
-        }
-      : {}),
+    ...(payload.api_key !== undefined ? { api_key: payload.api_key } : {}),
     ...(payload.embedding_api_key !== undefined
-      ? {
-          embedding_api_key_configured: payload.embedding_api_key.trim().length > 0,
-          embedding_api_key_preview: payload.embedding_api_key.trim().length > 0 ? "****" : "",
-        }
+      ? { embedding_api_key: payload.embedding_api_key }
       : {}),
-    updated_at: nowIso(),
   };
-  writeLocal(ASSISTANT_SETTINGS_KEY, next);
-  return next;
+  return request<AssistantSettings>("/settings/assistant", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 }
 
 export async function testAssistantConnection(
-  _payload?: AssistantConnectionTestPayload,
+  payload?: AssistantConnectionTestPayload,
 ): Promise<AssistantConnectionTestResult> {
-  const started = performance.now();
-  try {
-    await request<{ status: string }>("/health", { method: "GET" });
-    return {
-      ok: true,
-      provider: "backend",
-      mode: "health-check",
-      message: "Backend is reachable.",
-      latency_ms: Math.round(performance.now() - started),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      provider: "backend",
-      mode: "health-check",
-      message: error instanceof Error ? error.message : "Connection failed",
-      latency_ms: Math.round(performance.now() - started),
-    };
-  }
+  return request<AssistantConnectionTestResult>("/settings/assistant/test", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload ?? {}),
+  });
 }
 
 export function getLlamaParseSettings() {
-  return Promise.resolve(readLocal<LlamaParseSettings>(LLAMA_PARSE_SETTINGS_KEY, defaultLlamaParseSettings()));
+  return request<LlamaParseSettings>("/settings/llamaparse");
 }
 
 export async function updateLlamaParseSettings(
   payload: UpdateLlamaParseSettingsPayload,
 ) {
-  const current = await getLlamaParseSettings();
-  const next: LlamaParseSettings = {
-    ...current,
+  const body: {
+    enabled?: boolean;
+    api_key?: string;
+    base_url?: string;
+    model?: string;
+  } = {
     ...(payload.enabled != null ? { enabled: payload.enabled } : {}),
     ...(payload.base_url ? { base_url: payload.base_url } : {}),
-    ...(payload.target_pages != null ? { target_pages: payload.target_pages } : {}),
-    ...(payload.result_type ? { result_type: payload.result_type } : {}),
-    ...(payload.split_by_page != null ? { split_by_page: payload.split_by_page } : {}),
-    ...(payload.api_key !== undefined
-      ? {
-          api_key_configured: payload.api_key.trim().length > 0,
-          api_key_preview: payload.api_key.trim().length > 0 ? "****" : "",
-        }
-      : {}),
-    updated_at: nowIso(),
-  };
-  writeLocal(LLAMA_PARSE_SETTINGS_KEY, next);
-  return next;
-}
-
-export function listMultimodalOCRProviders() {
-  return Promise.resolve<AssistantProviderList>({
-    items: [
-      {
-        provider: "openai-compatible",
-        label: "OpenAI Compatible",
-        default_model: "gpt-4o-mini",
-        default_api_base: "https://api.openai.com/v1",
-        requires_api_key: true,
-      },
-    ],
-  });
-}
-
-export function getMultimodalOCRSettings() {
-  return Promise.resolve(readLocal<MultimodalOCRSettings>(OCR_SETTINGS_KEY, defaultOCRSettings()));
-}
-
-export async function updateMultimodalOCRSettings(
-  payload: UpdateMultimodalOCRSettingsPayload,
-) {
-  const current = await getMultimodalOCRSettings();
-  const next: MultimodalOCRSettings = {
-    ...current,
-    ...(payload.enabled != null ? { enabled: payload.enabled } : {}),
-    ...(payload.provider ? { provider: payload.provider } : {}),
     ...(payload.model ? { model: payload.model } : {}),
-    ...(payload.api_base ? { api_base: payload.api_base } : {}),
-    ...(payload.max_pages_per_doc != null ? { max_pages_per_doc: payload.max_pages_per_doc } : {}),
-    ...(payload.strategy ? { strategy: payload.strategy } : {}),
-    ...(payload.prompt != null ? { prompt: payload.prompt } : {}),
-    ...(payload.api_key !== undefined
-      ? {
-          api_key_configured: payload.api_key.trim().length > 0,
-          api_key_preview: payload.api_key.trim().length > 0 ? "****" : "",
-        }
-      : {}),
-    updated_at: nowIso(),
+    ...(payload.api_key !== undefined ? { api_key: payload.api_key } : {}),
   };
-  writeLocal(OCR_SETTINGS_KEY, next);
-  return next;
+  return request<LlamaParseSettings>("/settings/llamaparse", {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 }

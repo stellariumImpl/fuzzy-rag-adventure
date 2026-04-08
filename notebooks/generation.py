@@ -8,11 +8,16 @@ load_dotenv()
 
 # ── LLM 客户端 ────────────────────────────────────────────────────────────────
 
-client = OpenAI(
-    api_key=os.environ["LLM_API_KEY"],
-    base_url=os.environ.get("LLM_BASE_URL") or None,
-)
-MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
+def _get_llm_client_and_model() -> tuple[OpenAI, str]:
+    api_key = (os.environ.get("LLM_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("Missing LLM_API_KEY for answer generation.")
+    model = (os.environ.get("LLM_MODEL") or "gpt-4o").strip() or "gpt-4o"
+    client = OpenAI(
+        api_key=api_key,
+        base_url=os.environ.get("LLM_BASE_URL") or None,
+    )
+    return client, model
 
 
 # ── Step 1：把检索结果拼成带编号和来源标注的 context ──────────────────────────
@@ -47,6 +52,8 @@ def build_context(results: list[dict]) -> tuple[str, list[dict]]:
         sources.append({
             "index":        idx,
             "heading_path": heading,
+            "doc_id":       chunk.get("doc_id", ""),
+            "source_name":  chunk.get("source_name", chunk.get("doc_id", "")),
             "source_type":  source_type,
             "rerank_score": chunk.get("rerank_score", chunk.get("final_score", 0)),
         })
@@ -128,8 +135,9 @@ def generate(
 
 def _generate_sync(system_prompt: str, user_prompt: str) -> str:
     """非流式调用，等待完整响应后返回。"""
+    client, model = _get_llm_client_and_model()
     resp = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
@@ -144,8 +152,9 @@ def _generate_stream(system_prompt: str, user_prompt: str) -> str:
     流式调用，边生成边打印到终端。
     返回完整的答案字符串（方便后续处理）。
     """
+    client, model = _get_llm_client_and_model()
     stream = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},

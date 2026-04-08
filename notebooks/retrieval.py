@@ -45,7 +45,21 @@ def _collection_route_info(client, collection_name: str) -> dict[str, object]:
     """
     读取 collection schema，判断 dense/bm25/bm42 哪些路由可用。
     """
-    info = client.get_collection(collection_name)
+    try:
+        info = client.get_collection(collection_name)
+    except Exception as e:
+        text = str(e).lower()
+        # Qdrant collection missing: degrade retrieval gracefully instead of
+        # crashing the whole /answer endpoint with 500.
+        if "404" in text and "doesn" in text and "collection" in text:
+            print(f"提示: collection '{collection_name}' 不存在，向量检索将返回空结果。")
+            return {
+                "dense_using": None,
+                "bm25": False,
+                "bm42": False,
+                "missing_collection": True,
+            }
+        raise
 
     sparse_cfg = info.config.params.sparse_vectors or {}
     has_bm25 = "bm25" in sparse_cfg
@@ -63,6 +77,7 @@ def _collection_route_info(client, collection_name: str) -> dict[str, object]:
         "dense_using": dense_using,
         "bm25": has_bm25,
         "bm42": has_bm42,
+        "missing_collection": False,
     }
 
 
@@ -357,6 +372,8 @@ def vector_search(
 
     qdrant = _make_qdrant_client()
     route_info = _collection_route_info(qdrant, collection_name)
+    if route_info.get("missing_collection"):
+        return []
     _warn_if_sparse_route_missing(collection_name, route_info)
     candidate_k = top_k * 2
     scoped_doc_ids = _normalize_selected_doc_ids(selected_doc_ids)

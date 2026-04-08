@@ -37,6 +37,7 @@ REQUIRE_SELECTED_DOCS_FOR_ANSWER = os.environ.get("RAG_REQUIRE_SELECTED_DOCS_FOR
 
 DATA_DIR = PROJECT_ROOT / "backend" / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_STORE_PATH = DATA_DIR / "workspace_settings.json"
 UPLOAD_DIR = PROJECT_ROOT / "upload"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_STAGING_DIR = DATA_DIR / "upload_staging"
@@ -45,6 +46,7 @@ DOC_REGISTRY_PATH = DATA_DIR / "documents_registry.json"
 ALLOWED_DOC_LANGUAGES = {"en", "zh", "mixed", "auto"}
 DIRECT_INGEST_EXTENSIONS = {".md", ".txt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
+DEFAULT_USER_ID = "local-user"
 
 
 def _now_iso() -> str:
@@ -53,6 +55,377 @@ def _now_iso() -> str:
 
 def _safe_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("_", "-", ".") else "_" for ch in name)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _mask_secret(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "****"
+    return f"{raw[:4]}...{raw[-2:]}"
+
+
+def _normalize_provider_option(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    provider = str(raw.get("provider") or "").strip()
+    label = str(raw.get("label") or "").strip()
+    default_model = str(raw.get("default_model") or "").strip()
+    default_api_base = str(raw.get("default_api_base") or "").strip()
+    if not provider or not label:
+        return None
+    requires_api_key = bool(raw.get("requires_api_key", True))
+    return {
+        "provider": provider,
+        "label": label,
+        "default_model": default_model,
+        "default_api_base": default_api_base,
+        "requires_api_key": requires_api_key,
+    }
+
+
+def _load_provider_options_from_env(
+    env_name: str,
+    fallback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    raw = (os.environ.get(env_name) or "").strip()
+    if not raw:
+        return [dict(item) for item in fallback]
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return [dict(item) for item in fallback]
+    if not isinstance(payload, list):
+        return [dict(item) for item in fallback]
+
+    items: list[dict[str, Any]] = []
+    for item in payload:
+        normalized = _normalize_provider_option(item)
+        if normalized is not None:
+            items.append(normalized)
+    if not items:
+        return [dict(item) for item in fallback]
+    return items
+
+
+def _ensure_custom_provider(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    has_custom = any(str(item.get("provider") or "").strip() == "custom" for item in items)
+    if has_custom:
+        return items
+    next_items = [dict(item) for item in items]
+    next_items.append(
+        {
+            "provider": "custom",
+            "label": "Custom",
+            "default_model": "",
+            "default_api_base": "",
+            "requires_api_key": True,
+        }
+    )
+    return next_items
+
+
+def _build_provider_catalog() -> dict[str, list[dict[str, Any]]]:
+    assistant_fallback = [
+        {
+            "provider": "openai-compatible",
+            "label": "OpenAI Compatible",
+            "default_model": "gpt-4o",
+            "default_api_base": "https://api.openai.com/v1",
+            "requires_api_key": True,
+        },
+        {
+            "provider": "dashscope",
+            "label": "DashScope",
+            "default_model": "qwen-max",
+            "default_api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "requires_api_key": True,
+        },
+        {
+            "provider": "deepseek",
+            "label": "DeepSeek",
+            "default_model": "deepseek-chat",
+            "default_api_base": "https://api.deepseek.com/v1",
+            "requires_api_key": True,
+        },
+    ]
+    embedding_fallback = [
+        {
+            "provider": "bge",
+            "label": "BGE Local",
+            "default_model": "BAAI/bge-m3",
+            "default_api_base": "local",
+            "requires_api_key": False,
+        },
+        {
+            "provider": "openai-compatible",
+            "label": "OpenAI Compatible",
+            "default_model": "text-embedding-3-small",
+            "default_api_base": "https://api.openai.com/v1",
+            "requires_api_key": True,
+        },
+    ]
+    assistant = _ensure_custom_provider(
+        _load_provider_options_from_env("RAG_LLM_PROVIDER_OPTIONS", assistant_fallback)
+    )
+    embedding = _ensure_custom_provider(
+        _load_provider_options_from_env("RAG_EMBEDDING_PROVIDER_OPTIONS", embedding_fallback)
+    )
+    return {
+        "assistant": assistant,
+        "embedding": embedding,
+    }
+
+
+def _find_provider_option(options: list[dict[str, Any]], provider: str | None) -> dict[str, Any] | None:
+    target = str(provider or "").strip()
+    if not target:
+        return options[0] if options else None
+    for item in options:
+        if str(item.get("provider") or "").strip() == target:
+            return item
+    return options[0] if options else None
+
+
+def _default_assistant_settings(provider_catalog: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    now = _now_iso()
+    assistant_options = provider_catalog.get("assistant") or []
+    embedding_options = provider_catalog.get("embedding") or []
+
+    llm_env_provider = (os.environ.get("LLM_PROVIDER") or "").strip()
+    llm_default = _find_provider_option(assistant_options, llm_env_provider)
+    llm_provider = str((llm_default or {}).get("provider") or "openai-compatible")
+    llm_model = (os.environ.get("LLM_MODEL") or str((llm_default or {}).get("default_model") or "")).strip()
+    llm_api_base = (
+        os.environ.get("LLM_BASE_URL")
+        or str((llm_default or {}).get("default_api_base") or "")
+    ).strip()
+    llm_api_key = (os.environ.get("LLM_API_KEY") or "").strip()
+
+    embedder_override = (os.environ.get("EMBEDDER") or "").strip().lower()
+    embedding_env_provider = (os.environ.get("EMBEDDING_PROVIDER") or "").strip()
+    if not embedding_env_provider:
+        if embedder_override == "bge":
+            embedding_env_provider = "bge"
+        elif embedder_override == "openai":
+            embedding_env_provider = "openai-compatible"
+    embedding_default = _find_provider_option(embedding_options, embedding_env_provider)
+    embedding_provider = str((embedding_default or {}).get("provider") or "bge")
+    embedding_model = (
+        os.environ.get("EMBEDDING_MODEL") or str((embedding_default or {}).get("default_model") or "")
+    ).strip()
+    embedding_api_base = (
+        os.environ.get("EMBEDDING_BASE_URL")
+        or os.environ.get("LLM_BASE_URL")
+        or str((embedding_default or {}).get("default_api_base") or "")
+    ).strip()
+    embedding_api_key = (
+        os.environ.get("EMBEDDING_API_KEY")
+        or ("" if embedding_provider == "bge" else os.environ.get("LLM_API_KEY", ""))
+    ).strip()
+
+    return {
+        "user_id": DEFAULT_USER_ID,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "api_base": llm_api_base,
+        "api_key": llm_api_key,
+        "temperature": float(os.environ.get("LLM_TEMPERATURE", "0.2")),
+        "max_tokens": int(os.environ.get("LLM_MAX_TOKENS", "512")),
+        "embedding_provider": embedding_provider,
+        "embedding_model": embedding_model,
+        "embedding_api_base": embedding_api_base,
+        "embedding_api_key": embedding_api_key,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _default_llamaparse_settings() -> dict[str, Any]:
+    now = _now_iso()
+    env_job_url = (os.environ.get("JOB_URL") or "").strip()
+    env_token = (os.environ.get("TOKEN") or "").strip()
+    env_model = (os.environ.get("MODEL") or "").strip()
+    env_ready = bool(env_job_url and env_token and env_model)
+    return {
+        "user_id": DEFAULT_USER_ID,
+        "enabled": _env_bool("LLAMAPARSE_ENABLED", env_ready),
+        "base_url": (os.environ.get("LLAMAPARSE_BASE_URL") or env_job_url or "").strip(),
+        "model": (os.environ.get("LLAMAPARSE_MODEL") or env_model or "").strip(),
+        "api_key": (os.environ.get("LLAMAPARSE_API_KEY") or env_token or "").strip(),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _merge_dict_with_defaults(defaults: dict[str, Any], current: Any) -> dict[str, Any]:
+    merged = dict(defaults)
+    if not isinstance(current, dict):
+        return merged
+    for key, value in current.items():
+        if key in merged:
+            merged[key] = value
+    return merged
+
+
+def _write_settings_store_unlocked(state: dict[str, Any]) -> None:
+    SETTINGS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_STORE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _load_workspace_settings_state() -> dict[str, Any]:
+    catalog = _build_provider_catalog()
+    defaults = {
+        "assistant": _default_assistant_settings(catalog),
+        "llamaparse": _default_llamaparse_settings(),
+    }
+    with _SETTINGS_LOCK:
+        raw: dict[str, Any] = {}
+        if SETTINGS_STORE_PATH.exists():
+            try:
+                loaded = json.loads(SETTINGS_STORE_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except Exception:
+                raw = {}
+
+        assistant = _merge_dict_with_defaults(defaults["assistant"], raw.get("assistant"))
+        llama = _merge_dict_with_defaults(defaults["llamaparse"], raw.get("llamaparse"))
+
+        # Normalize critical fields.
+        assistant["temperature"] = float(assistant.get("temperature", 0.2))
+        assistant["max_tokens"] = int(assistant.get("max_tokens", 512))
+
+        state = {
+            "assistant": assistant,
+            "llamaparse": llama,
+        }
+        if raw != state:
+            _write_settings_store_unlocked(state)
+    return state
+
+
+def _save_workspace_settings_state(state: dict[str, Any]) -> None:
+    with _SETTINGS_LOCK:
+        _write_settings_store_unlocked(state)
+
+
+def _assistant_settings_public(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_id": str(settings.get("user_id") or DEFAULT_USER_ID),
+        "llm_provider": str(settings.get("llm_provider") or ""),
+        "llm_model": str(settings.get("llm_model") or ""),
+        "api_base": str(settings.get("api_base") or ""),
+        "api_key_configured": bool(str(settings.get("api_key") or "").strip()),
+        "api_key_preview": _mask_secret(str(settings.get("api_key") or "")),
+        "temperature": float(settings.get("temperature", 0.2)),
+        "max_tokens": int(settings.get("max_tokens", 512)),
+        "embedding_provider": str(settings.get("embedding_provider") or ""),
+        "embedding_model": str(settings.get("embedding_model") or ""),
+        "embedding_api_base": str(settings.get("embedding_api_base") or ""),
+        "embedding_api_key_configured": bool(str(settings.get("embedding_api_key") or "").strip()),
+        "embedding_api_key_preview": _mask_secret(str(settings.get("embedding_api_key") or "")),
+        "created_at": str(settings.get("created_at") or _now_iso()),
+        "updated_at": str(settings.get("updated_at") or _now_iso()),
+    }
+
+
+def _llamaparse_settings_public(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_id": str(settings.get("user_id") or DEFAULT_USER_ID),
+        "enabled": bool(settings.get("enabled", False)),
+        "base_url": str(settings.get("base_url") or ""),
+        "model": str(settings.get("model") or ""),
+        "api_key_configured": bool(str(settings.get("api_key") or "").strip()),
+        "api_key_preview": _mask_secret(str(settings.get("api_key") or "")),
+        "created_at": str(settings.get("created_at") or _now_iso()),
+        "updated_at": str(settings.get("updated_at") or _now_iso()),
+    }
+
+
+def _apply_runtime_settings(assistant_settings: dict[str, Any]) -> None:
+    llm_key = str(assistant_settings.get("api_key") or "").strip()
+    llm_base = str(assistant_settings.get("api_base") or "").strip()
+    llm_model = str(assistant_settings.get("llm_model") or "").strip()
+    embedding_provider = str(assistant_settings.get("embedding_provider") or "").strip().lower()
+    embedding_key = str(assistant_settings.get("embedding_api_key") or "").strip()
+    embedding_base = str(assistant_settings.get("embedding_api_base") or "").strip()
+    embedding_model = str(assistant_settings.get("embedding_model") or "").strip()
+
+    if llm_key:
+        os.environ["LLM_API_KEY"] = llm_key
+    else:
+        os.environ.pop("LLM_API_KEY", None)
+    if llm_base:
+        os.environ["LLM_BASE_URL"] = llm_base
+    else:
+        os.environ.pop("LLM_BASE_URL", None)
+    if llm_model:
+        os.environ["LLM_MODEL"] = llm_model
+        os.environ.setdefault("MULTI_QUERY_MODEL", llm_model)
+    else:
+        os.environ.pop("LLM_MODEL", None)
+
+    if embedding_provider in {"bge", "local", "local-bge"}:
+        os.environ["EMBEDDER"] = "bge"
+    else:
+        os.environ["EMBEDDER"] = "openai"
+    if embedding_model:
+        os.environ["EMBEDDING_MODEL"] = embedding_model
+    else:
+        os.environ.pop("EMBEDDING_MODEL", None)
+    if embedding_base:
+        os.environ["EMBEDDING_BASE_URL"] = embedding_base
+    else:
+        os.environ.pop("EMBEDDING_BASE_URL", None)
+    if embedding_key:
+        os.environ["EMBEDDING_API_KEY"] = embedding_key
+    else:
+        os.environ.pop("EMBEDDING_API_KEY", None)
+
+
+def _apply_llamaparse_runtime_settings(llamaparse_settings: dict[str, Any]) -> None:
+    enabled = bool(llamaparse_settings.get("enabled", False))
+    job_url = str(llamaparse_settings.get("base_url") or "").strip()
+    token = str(llamaparse_settings.get("api_key") or "").strip()
+    model = str(llamaparse_settings.get("model") or "").strip()
+    if enabled and job_url and token and model:
+        os.environ["JOB_URL"] = job_url
+        os.environ["TOKEN"] = token
+        os.environ["MODEL"] = model
+        return
+    os.environ.pop("JOB_URL", None)
+    os.environ.pop("TOKEN", None)
+    os.environ.pop("MODEL", None)
+
+
+def _reset_runtime_state_after_settings_change() -> None:
+    with _SERVICE_LOCK:
+        _SERVICE_CACHE.clear()
+    try:
+        import notebooks.retrieval as retrieval  # noqa: WPS433
+
+        retrieval._MULTI_QUERY_CLIENT = None
+        retrieval._MULTI_QUERY_CACHE.clear()
+    except Exception:
+        pass
+
+
+def _sync_runtime_settings_from_store() -> None:
+    state = _load_workspace_settings_state()
+    _apply_runtime_settings(state["assistant"])
+    _apply_llamaparse_runtime_settings(state["llamaparse"])
 
 
 def _table_records_store_path(collection_name: str) -> Path:
@@ -168,12 +541,48 @@ class DocumentPatchRequest(BaseModel):
     description: str | None = None
 
 
+class AssistantSettingsPatchRequest(BaseModel):
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    api_base: str | None = None
+    api_key: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedding_api_base: str | None = None
+    embedding_api_key: str | None = None
+
+
+class AssistantConnectionTestRequest(BaseModel):
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    api_base: str | None = None
+    api_key: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedding_api_base: str | None = None
+    embedding_api_key: str | None = None
+
+
+class LlamaParseSettingsPatchRequest(BaseModel):
+    enabled: bool | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+
+
 _TASKS: dict[str, dict[str, Any]] = {}
 _TASK_LOCK = Lock()
 _DOC_LOCK = Lock()
+_SETTINGS_LOCK = Lock()
 
 _SERVICE_CACHE: dict[str, RAGService] = {}
 _SERVICE_LOCK = Lock()
+
+_sync_runtime_settings_from_store()
 
 
 def _new_task() -> str:
@@ -255,6 +664,7 @@ def _generate_chat_title_with_llm(
     answer: str,
     current_title: str | None = None,
 ) -> str:
+    _sync_runtime_settings_from_store()
     fallback = _fallback_chat_title(question, current_title)
     api_key = os.environ.get("LLM_API_KEY")
     if not api_key:
@@ -1301,6 +1711,7 @@ def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, in
 
 def _run_ingest_task(task_id: str, req: IngestRequest) -> None:
     try:
+        _sync_runtime_settings_from_store()
         _update_task(
             task_id,
             status="running",
@@ -1443,6 +1854,223 @@ def health() -> dict[str, Any]:
     }
 
 
+@app.get("/settings/providers/assistant")
+def list_assistant_providers() -> dict[str, Any]:
+    return {"items": _build_provider_catalog()["assistant"]}
+
+
+@app.get("/settings/providers/embedding")
+def list_embedding_providers() -> dict[str, Any]:
+    return {"items": _build_provider_catalog()["embedding"]}
+
+
+@app.get("/settings/assistant")
+def get_assistant_settings(
+    llm_provider: str | None = None,
+    embedding_provider: str | None = None,
+) -> dict[str, Any]:
+    state = _load_workspace_settings_state()
+    catalog = _build_provider_catalog()
+    settings = dict(state["assistant"])
+
+    if llm_provider is not None:
+        target_llm_provider = str(llm_provider or "").strip()
+        if target_llm_provider:
+            selected = _find_provider_option(catalog["assistant"], target_llm_provider)
+            settings["llm_provider"] = str((selected or {}).get("provider") or target_llm_provider)
+            settings["llm_model"] = str((selected or {}).get("default_model") or settings.get("llm_model") or "")
+            settings["api_base"] = str((selected or {}).get("default_api_base") or settings.get("api_base") or "")
+
+    if embedding_provider is not None:
+        target_embedding_provider = str(embedding_provider or "").strip()
+        if target_embedding_provider:
+            selected = _find_provider_option(catalog["embedding"], target_embedding_provider)
+            settings["embedding_provider"] = str(
+                (selected or {}).get("provider") or target_embedding_provider
+            )
+            settings["embedding_model"] = str(
+                (selected or {}).get("default_model") or settings.get("embedding_model") or ""
+            )
+            settings["embedding_api_base"] = str(
+                (selected or {}).get("default_api_base") or settings.get("embedding_api_base") or ""
+            )
+
+    return _assistant_settings_public(settings)
+
+
+@app.patch("/settings/assistant")
+def patch_assistant_settings(req: AssistantSettingsPatchRequest) -> dict[str, Any]:
+    state = _load_workspace_settings_state()
+    settings = dict(state["assistant"])
+    fields_set = set(req.model_fields_set)
+    if not fields_set:
+        return _assistant_settings_public(settings)
+
+    if "llm_provider" in fields_set:
+        llm_provider = str(req.llm_provider or "").strip()
+        if not llm_provider:
+            raise HTTPException(status_code=400, detail="llm_provider cannot be empty")
+        settings["llm_provider"] = llm_provider
+    if "llm_model" in fields_set:
+        settings["llm_model"] = str(req.llm_model or "").strip()
+    if "api_base" in fields_set:
+        settings["api_base"] = str(req.api_base or "").strip()
+    if "temperature" in fields_set:
+        if req.temperature is None or req.temperature < 0 or req.temperature > 2:
+            raise HTTPException(status_code=400, detail="temperature must be between 0 and 2")
+        settings["temperature"] = float(req.temperature)
+    if "max_tokens" in fields_set:
+        if req.max_tokens is None or req.max_tokens < 64 or req.max_tokens > 4096:
+            raise HTTPException(status_code=400, detail="max_tokens must be between 64 and 4096")
+        settings["max_tokens"] = int(req.max_tokens)
+    if "api_key" in fields_set:
+        settings["api_key"] = str(req.api_key or "").strip()
+
+    if "embedding_provider" in fields_set:
+        embedding_provider = str(req.embedding_provider or "").strip()
+        if not embedding_provider:
+            raise HTTPException(status_code=400, detail="embedding_provider cannot be empty")
+        settings["embedding_provider"] = embedding_provider
+    if "embedding_model" in fields_set:
+        settings["embedding_model"] = str(req.embedding_model or "").strip()
+    if "embedding_api_base" in fields_set:
+        settings["embedding_api_base"] = str(req.embedding_api_base or "").strip()
+    if "embedding_api_key" in fields_set:
+        settings["embedding_api_key"] = str(req.embedding_api_key or "").strip()
+
+    settings["updated_at"] = _now_iso()
+    state["assistant"] = settings
+    _save_workspace_settings_state(state)
+    _apply_runtime_settings(settings)
+    _reset_runtime_state_after_settings_change()
+    return _assistant_settings_public(settings)
+
+
+@app.post("/settings/assistant/test")
+def test_assistant_connection(req: AssistantConnectionTestRequest) -> dict[str, Any]:
+    import time
+
+    started = time.perf_counter()
+    state = _load_workspace_settings_state()
+    current = state["assistant"]
+
+    llm_provider = str(req.llm_provider or current.get("llm_provider") or "unknown").strip() or "unknown"
+    llm_model = str(req.llm_model or current.get("llm_model") or "").strip()
+    api_base = str(req.api_base or current.get("api_base") or "").strip()
+    api_key = str(req.api_key or current.get("api_key") or "").strip()
+
+    if not llm_model:
+        return {
+            "ok": False,
+            "provider": llm_provider,
+            "mode": "chat-completions",
+            "message": "LLM model is required.",
+            "latency_ms": int(max(0, (time.perf_counter() - started) * 1000)),
+        }
+    if not api_key:
+        return {
+            "ok": False,
+            "provider": llm_provider,
+            "mode": "chat-completions",
+            "message": "LLM API key is required.",
+            "latency_ms": int(max(0, (time.perf_counter() - started) * 1000)),
+        }
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=api_base or None,
+        )
+        client.chat.completions.create(
+            model=llm_model,
+            temperature=0,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return {
+            "ok": True,
+            "provider": llm_provider,
+            "mode": "chat-completions",
+            "message": "Connection succeeded.",
+            "latency_ms": int(max(0, (time.perf_counter() - started) * 1000)),
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "provider": llm_provider,
+            "mode": "chat-completions",
+            "message": f"{type(e).__name__}: {e}",
+            "latency_ms": int(max(0, (time.perf_counter() - started) * 1000)),
+        }
+
+
+@app.get("/settings/assistant/retrieval-status")
+def get_assistant_retrieval_status() -> dict[str, Any]:
+    settings = _load_workspace_settings_state()["assistant"]
+    catalog = _build_provider_catalog()
+
+    ready_docs = sum(1 for row in _list_document_records() if str(row.get("status") or "") == "ready")
+    reasons: list[str] = []
+    if ready_docs <= 0:
+        reasons.append("no_ready_documents")
+
+    llm_provider = str(settings.get("llm_provider") or "")
+    llm_requires_key = bool((_find_provider_option(catalog["assistant"], llm_provider) or {}).get("requires_api_key", True))
+    llm_key_configured = bool(str(settings.get("api_key") or "").strip())
+    if llm_requires_key and not llm_key_configured:
+        reasons.append("llm_api_key_missing")
+
+    embedding_provider = str(settings.get("embedding_provider") or "")
+    embedding_option = _find_provider_option(catalog["embedding"], embedding_provider)
+    embedding_requires_key = bool((embedding_option or {}).get("requires_api_key", True))
+    embedding_key_configured = bool(str(settings.get("embedding_api_key") or "").strip())
+    if embedding_requires_key and not embedding_key_configured:
+        reasons.append("embedding_api_key_missing")
+
+    mode = "hybrid" if not reasons else "fallback"
+    return {
+        "mode": mode,
+        "reasons": reasons,
+        "llm_provider": llm_provider,
+        "llm_model": str(settings.get("llm_model") or ""),
+        "llm_api_key_configured": llm_key_configured,
+        "embedding_provider": embedding_provider,
+        "embedding_model": str(settings.get("embedding_model") or ""),
+        "embedding_api_key_configured": embedding_key_configured,
+        "ready_document_count": ready_docs,
+    }
+
+
+@app.get("/settings/llamaparse")
+def get_llamaparse_settings() -> dict[str, Any]:
+    settings = _load_workspace_settings_state()["llamaparse"]
+    return _llamaparse_settings_public(settings)
+
+
+@app.patch("/settings/llamaparse")
+def patch_llamaparse_settings(req: LlamaParseSettingsPatchRequest) -> dict[str, Any]:
+    state = _load_workspace_settings_state()
+    settings = dict(state["llamaparse"])
+    fields_set = set(req.model_fields_set)
+    if not fields_set:
+        return _llamaparse_settings_public(settings)
+
+    if "enabled" in fields_set and req.enabled is not None:
+        settings["enabled"] = bool(req.enabled)
+    if "base_url" in fields_set:
+        settings["base_url"] = str(req.base_url or "").strip()
+    if "model" in fields_set:
+        settings["model"] = str(req.model or "").strip()
+    if "api_key" in fields_set:
+        settings["api_key"] = str(req.api_key or "").strip()
+
+    settings["updated_at"] = _now_iso()
+    state["llamaparse"] = settings
+    _save_workspace_settings_state(state)
+    _sync_runtime_settings_from_store()
+    return _llamaparse_settings_public(settings)
+
+
 @app.post("/ingest", response_model=IngestAccepted)
 def ingest(req: IngestRequest, background_tasks: BackgroundTasks) -> IngestAccepted:
     task_id = _new_task()
@@ -1475,16 +2103,23 @@ async def upload(
 
     if suffix == ".pdf":
         parser_mode = "pypdf"
+        remote_parse_warning: str | None = None
         try:
-            if all(
+            remote_parse_ready = all(
                 [
                     (os.environ.get("JOB_URL") or "").strip(),
                     (os.environ.get("TOKEN") or "").strip(),
                     (os.environ.get("MODEL") or "").strip(),
                 ]
-            ):
-                ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf_via_job_api(stored_path)
-                parser_mode = "notebook_job_api"
+            )
+            if remote_parse_ready:
+                try:
+                    ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf_via_job_api(stored_path)
+                    parser_mode = "notebook_job_api"
+                except Exception as remote_exc:
+                    remote_parse_warning = f"{type(remote_exc).__name__}: {remote_exc}".replace("\n", " ")
+                    ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf(stored_path)
+                    parser_mode = "pypdf_fallback_from_remote"
             else:
                 ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf(stored_path)
                 parser_mode = "pypdf"
@@ -1513,6 +2148,17 @@ async def upload(
                 doc_id=resolved_doc_id,
             )
         except Exception as e:
+            parse_summary = f"Uploaded only; PDF extract failed: {type(e).__name__}"
+            response_message = f"文件已上传，但 PDF 文本提取失败：{type(e).__name__}: {e}"
+            if remote_parse_warning:
+                parse_summary = (
+                    f"Uploaded only; remote+local PDF extract failed. "
+                    f"remote={remote_parse_warning[:220]}, local={type(e).__name__}"
+                )
+                response_message = (
+                    "文件已上传，但远端解析失败且本地回退也失败："
+                    f"远端={remote_parse_warning}；本地={type(e).__name__}: {e}"
+                )
             _upsert_document_registry(
                 {
                     "doc_id": resolved_doc_id,
@@ -1523,7 +2169,7 @@ async def upload(
                     "mime_type": file.content_type,
                     "size_bytes": len(raw),
                     "status": "uploaded_only",
-                    "parse_summary": f"Uploaded only; PDF extract failed: {type(e).__name__}",
+                    "parse_summary": parse_summary,
                     "parse_provider": parser_mode,
                 }
             )
@@ -1531,7 +2177,7 @@ async def upload(
                 filename=original_name,
                 stored_path=str(stored_path),
                 status="uploaded_only",
-                message=f"文件已上传，但 PDF 文本提取失败：{type(e).__name__}: {e}",
+                message=response_message,
                 collection_name=collection_name,
                 doc_language=doc_language,
                 doc_id=resolved_doc_id,
@@ -1548,6 +2194,17 @@ async def upload(
         task_id = _new_task()
         background_tasks.add_task(_run_ingest_task, task_id, req)
 
+        parse_summary = (
+            f"Queued for indexing ({parser_mode}, pdf pages={page_count}, empty_pages={empty_pages})"
+        )
+        response_message = "文件已上传，PDF 文本提取完成并进入入库队列。"
+        if remote_parse_warning:
+            parse_summary = (
+                f"Queued for indexing ({parser_mode}, remote_error={remote_parse_warning[:220]}, "
+                f"pdf pages={page_count}, empty_pages={empty_pages})"
+            )
+            response_message = "文件已上传；远端解析失败，已自动回退本地 pypdf 并进入入库队列。"
+
         _upsert_document_registry(
             {
                 "doc_id": resolved_doc_id,
@@ -1562,9 +2219,7 @@ async def upload(
                 "status": "parsing",
                 "task_id": task_id,
                 "task_status": "queued",
-                "parse_summary": (
-                    f"Queued for indexing ({parser_mode}, pdf pages={page_count}, empty_pages={empty_pages})"
-                ),
+                "parse_summary": parse_summary,
                 "parse_provider": parser_mode,
             }
         )
@@ -1573,7 +2228,7 @@ async def upload(
             filename=original_name,
             stored_path=str(stored_path),
             status="queued",
-            message="文件已上传，PDF 文本提取完成并进入入库队列。",
+            message=response_message,
             collection_name=collection_name,
             doc_language=doc_language,
             task_id=task_id,
@@ -1755,6 +2410,7 @@ def get_task(task_id: str) -> TaskStatus:
 
 @app.post("/chat/title", response_model=ChatTitleResponse)
 def generate_chat_title(req: ChatTitleRequest) -> ChatTitleResponse:
+    _sync_runtime_settings_from_store()
     question = str(req.question or "").strip()
     answer = str(req.answer or "").strip()
     if not question:
@@ -1772,6 +2428,7 @@ def generate_chat_title(req: ChatTitleRequest) -> ChatTitleResponse:
 
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest) -> SearchResponse:
+    _sync_runtime_settings_from_store()
     table_path = (
         Path(req.table_records_path)
         if req.table_records_path
@@ -1802,6 +2459,7 @@ def search(req: SearchRequest) -> SearchResponse:
 
 @app.post("/answer", response_model=AnswerResponse)
 def answer(req: AnswerRequest) -> AnswerResponse:
+    _sync_runtime_settings_from_store()
     selected_doc_ids = _normalize_selected_doc_ids(req.selected_doc_ids)
     if REQUIRE_SELECTED_DOCS_FOR_ANSWER and not selected_doc_ids:
         raise HTTPException(
@@ -1832,9 +2490,50 @@ def answer(req: AnswerRequest) -> AnswerResponse:
         selected_doc_ids=selected_doc_ids,
         stream=False,
     )
+
+    # Enrich retrieval/sources with stable source_name so frontend labels are
+    # human-readable and do not look like cross-document contamination.
+    doc_name_map: dict[str, str] = {}
+    for row in _list_document_records():
+        doc_id = str(row.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        doc_name_map[doc_id] = str(row.get("source_name") or doc_id).strip() or doc_id
+
+    normalized_results: list[dict[str, Any]] = []
+    raw_results = out.get("retrieval_results", [])
+    if isinstance(raw_results, list):
+        for row in raw_results:
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            doc_id = str(item.get("doc_id") or "").strip()
+            if doc_id:
+                item["source_name"] = doc_name_map.get(doc_id, doc_id)
+            normalized_results.append(item)
+
+    normalized_sources: list[dict[str, Any]] = []
+    raw_sources = out.get("sources", [])
+    if isinstance(raw_sources, list):
+        for i, row in enumerate(raw_sources):
+            item = dict(row) if isinstance(row, dict) else {}
+            idx_raw = int(item.get("index") or (i + 1))
+            ref_idx = idx_raw - 1
+            ref = normalized_results[ref_idx] if 0 <= ref_idx < len(normalized_results) else {}
+            doc_id = str(item.get("doc_id") or ref.get("doc_id") or "").strip()
+            if doc_id:
+                item["doc_id"] = doc_id
+                item["source_name"] = doc_name_map.get(
+                    doc_id,
+                    str(ref.get("source_name") or doc_id),
+                )
+            elif ref.get("source_name"):
+                item["source_name"] = str(ref.get("source_name"))
+            normalized_sources.append(item)
+
     return AnswerResponse(
         question=out.get("question", req.question),
         answer=out.get("answer", ""),
-        sources=out.get("sources", []),
-        retrieval_results=out.get("retrieval_results", []),
+        sources=normalized_sources,
+        retrieval_results=normalized_results,
     )
