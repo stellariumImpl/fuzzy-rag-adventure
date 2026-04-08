@@ -40,7 +40,11 @@
 .app-shell[data-theme="light"] .bg-\[\#0f1623\],
 .app-shell[data-theme="light"] .bg-\[\#0e1522\],
 .app-shell[data-theme="light"] .bg-\[\#0d1320\],
-.app-shell[data-theme="light"] .bg-\[\#0c1320\] {
+.app-shell[data-theme="light"] .bg-\[\#0c1320\],
+.app-shell[data-theme="light"] .bg-\[\#111827\],
+.app-shell[data-theme="light"] .bg-\[\#0f1726\],
+.app-shell[data-theme="light"] .bg-\[\#121b2d\],
+.app-shell[data-theme="light"] .bg-\[\#111b2d\] {
   background-color: #f6f9ff !important;
 }
 
@@ -55,6 +59,10 @@
 .app-shell[data-theme="light"] .bg-\[\#263041\],
 .app-shell[data-theme="light"] .bg-\[\#253247\] {
   background-color: #d6dfef !important;
+}
+
+.app-shell[data-theme="light"] .bg-\[\#25344f\] {
+  background-color: #dbe8fb !important;
 }
 
 .app-shell[data-theme="light"] .bg-\[\#2a4c78\],
@@ -84,6 +92,8 @@
 .app-shell[data-theme="light"] .border-\[\#2d3648\],
 .app-shell[data-theme="light"] .border-\[\#2b3445\],
 .app-shell[data-theme="light"] .border-\[\#2f3a4f\],
+.app-shell[data-theme="light"] .border-\[\#2f3a4e\],
+.app-shell[data-theme="light"] .border-\[\#2e3b51\],
 .app-shell[data-theme="light"] .border-\[\#32415a\],
 .app-shell[data-theme="light"] .border-\[\#314159\] {
   border-color: #c6d5ea !important;
@@ -144,12 +154,20 @@
 
 .app-shell[data-theme="light"] .text-\[\#aeb7c7\],
 .app-shell[data-theme="light"] .text-\[\#b8c2d3\],
+.app-shell[data-theme="light"] .text-\[\#b6c7df\],
+.app-shell[data-theme="light"] .text-\[\#b9d3ff\],
 .app-shell[data-theme="light"] .text-\[\#c2cada\],
 .app-shell[data-theme="light"] .text-\[\#c6cfde\],
+.app-shell[data-theme="light"] .text-\[\#ced7e6\],
 .app-shell[data-theme="light"] .text-\[\#cdd7e8\],
 .app-shell[data-theme="light"] .text-\[\#c3c8d3\],
 .app-shell[data-theme="light"] .text-\[\#6f7d95\] {
   color: #4f6178 !important;
+}
+
+.app-shell[data-theme="light"] .text-\[\#93a4be\],
+.app-shell[data-theme="light"] .text-\[\#8ea0ba\] {
+  color: #6a7c95 !important;
 }
 
 .app-shell[data-theme="light"] .hover\:text-white:hover {
@@ -157,6 +175,7 @@
 }
 
 .app-shell[data-theme="light"] .hover\:bg-\[\#252933\]:hover,
+.app-shell[data-theme="light"] .hover\:bg-\[\#111b2d\]:hover,
 .app-shell[data-theme="light"] .hover\:bg-\[\#181e2a\]:hover,
 .app-shell[data-theme="light"] .hover\:bg-\[\#1a202b\]:hover,
 .app-shell[data-theme="light"] .hover\:bg-\[\#1a1f2b\]:hover,
@@ -224,6 +243,10 @@
   color: #2f73cd !important;
 }
 
+.app-shell[data-theme="light"] .text-\[\#b9d3ff\] {
+  color: #2f73cd !important;
+}
+
 .app-shell[data-theme="light"] .border-\[\#4d5565\] {
   border-color: #c2d0e2 !important;
 }
@@ -248,10 +271,61 @@
   box-shadow: none;
 }
 
+.source-snippet {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.message-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+  vertical-align: middle;
+  border: 1px solid transparent;
+  background-color: transparent;
+  transition:
+    color 140ms ease,
+    opacity 140ms ease;
+}
+
+.message-action-btn svg {
+  display: block;
+}
+
+.message-action-btn:hover {
+  background-color: transparent !important;
+  border-color: transparent !important;
+  color: #ffffff !important;
+}
+
+.message-action-btn.is-active {
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+
 .app-shell[data-theme="light"] .chat-add-documents-trigger {
   background-color: #f4f8ff !important;
   border-color: #c6d4e7 !important;
   color: #4c5e78 !important;
+}
+
+.app-shell[data-theme="light"] .message-action-btn {
+  color: #6f7f95 !important;
+}
+
+.app-shell[data-theme="light"] .message-action-btn:hover {
+  background-color: transparent !important;
+  border-color: transparent !important;
+  color: #2f4a70 !important;
+}
+
+.app-shell[data-theme="light"] .message-action-btn.is-active {
+  background-color: transparent !important;
+  border-color: transparent !important;
 }
 
 .app-shell[data-theme="light"] .chat-add-documents-trigger:hover {

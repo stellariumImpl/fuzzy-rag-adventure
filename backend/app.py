@@ -47,6 +47,8 @@ ALLOWED_DOC_LANGUAGES = {"en", "zh", "mixed", "auto"}
 DIRECT_INGEST_EXTENSIONS = {".md", ".txt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
 DEFAULT_USER_ID = "local-user"
+ODL_PAGE_MARKER_TEMPLATE = "<!--ODL_PAGE_%page-number%-->"
+ODL_PAGE_MARKER_REGEX = re.compile(r"<!--ODL_PAGE_(\d+)-->")
 
 
 def _now_iso() -> str:
@@ -1511,19 +1513,6 @@ def _extract_thumbnail_markdown(row: dict[str, Any]) -> str:
         return _read_uploaded_text(storage_path)
     if suffix == ".txt" or media_type.startswith("text/"):
         return _read_uploaded_text(storage_path)
-    if suffix == ".pdf":
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(str(storage_path))
-            if not reader.pages:
-                return ""
-            first = (reader.pages[0].extract_text() or "").strip()
-            if first:
-                return f"# {storage_path.stem}\n\n{first}"
-        except Exception:
-            return ""
-
     return ""
 
 
@@ -1551,43 +1540,80 @@ def _materialize_uploaded_markdown(uploaded_path: Path) -> Path:
     return output_dir
 
 
+def _split_opendataloader_markdown_pages(markdown_text: str) -> list[tuple[int, str]]:
+    matches = list(ODL_PAGE_MARKER_REGEX.finditer(markdown_text))
+    if not matches:
+        content = markdown_text.strip()
+        return [(1, content)] if content else []
+
+    pages: list[tuple[int, str]] = []
+    for idx, match in enumerate(matches):
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown_text)
+        try:
+            page_no = int(match.group(1))
+        except Exception:
+            page_no = len(pages) + 1
+        page_text = markdown_text[match.end() : next_start].strip()
+        pages.append((page_no, page_text))
+
+    pages.sort(key=lambda item: item[0])
+    deduped: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for page_no, text in pages:
+        if page_no in seen:
+            continue
+        seen.add(page_no)
+        deduped.append((page_no, text))
+    return deduped
+
+
 def _materialize_uploaded_pdf(uploaded_path: Path) -> tuple[Path, int, int]:
     """
-    将 PDF 抽取为多页 markdown：doc_0.md, doc_1.md, ...
+    使用 opendataloader-pdf 将 PDF 抽取为多页 markdown：doc_0.md, doc_1.md, ...
     返回 (output_dir, page_count, empty_page_count)。
     """
-    from pypdf import PdfReader
+    import opendataloader_pdf
 
-    reader = PdfReader(str(uploaded_path))
-    page_count = len(reader.pages)
     output_dir = UPLOAD_STAGING_DIR / f"{uploaded_path.stem}_{uuid.uuid4().hex[:8]}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    empty_pages = 0
-    if page_count == 0:
+    opendataloader_pdf.convert(
+        input_path=str(uploaded_path),
+        output_dir=str(output_dir),
+        format="markdown-with-html",
+        markdown_page_separator=ODL_PAGE_MARKER_TEMPLATE,
+        image_output="external",
+        quiet=True,
+    )
+
+    markdown_candidates = sorted(output_dir.glob("*.md")) + sorted(output_dir.glob("*.markdown"))
+    if not markdown_candidates:
+        raise RuntimeError("opendataloader parser returned no markdown file")
+
+    preferred = output_dir / f"{uploaded_path.stem}.md"
+    merged_markdown_path = preferred if preferred.exists() else markdown_candidates[0]
+    merged_markdown = _read_uploaded_text(merged_markdown_path)
+    pages = _split_opendataloader_markdown_pages(merged_markdown)
+
+    if not pages:
         (output_dir / "doc_0.md").write_text(
             f"# {uploaded_path.stem}\n\n(empty pdf)\n",
             encoding="utf-8",
         )
         return output_dir, 0, 0
 
-    for idx, page in enumerate(reader.pages):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-
+    empty_pages = 0
+    for idx, (page_no, text) in enumerate(pages):
         text = text.strip()
         if not text:
             empty_pages += 1
-            text = "(empty page or image-only page)"
+            text = f"# {uploaded_path.stem} - page {page_no}\n\n(empty page or image-only page)\n"
+        elif not text.endswith("\n"):
+            text = text + "\n"
 
-        (output_dir / f"doc_{idx}.md").write_text(
-            f"# {uploaded_path.stem} - page {idx + 1}\n\n{text}\n",
-            encoding="utf-8",
-        )
+        (output_dir / f"doc_{idx}.md").write_text(text, encoding="utf-8")
 
-    return output_dir, page_count, empty_pages
+    return output_dir, len(pages), empty_pages
 
 
 def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, int, int]:
@@ -2102,7 +2128,7 @@ async def upload(
     resolved_doc_id = (doc_id or Path(original_name).stem or Path(stamped_name).stem).strip() or None
 
     if suffix == ".pdf":
-        parser_mode = "pypdf"
+        parser_mode = "opendataloader"
         remote_parse_warning: str | None = None
         try:
             remote_parse_ready = all(
@@ -2119,11 +2145,11 @@ async def upload(
                 except Exception as remote_exc:
                     remote_parse_warning = f"{type(remote_exc).__name__}: {remote_exc}".replace("\n", " ")
                     ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf(stored_path)
-                    parser_mode = "pypdf_fallback_from_remote"
+                    parser_mode = "opendataloader_fallback_from_remote"
             else:
                 ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf(stored_path)
-                parser_mode = "pypdf"
-        except ModuleNotFoundError:
+                parser_mode = "opendataloader"
+        except (ModuleNotFoundError, FileNotFoundError):
             _upsert_document_registry(
                 {
                     "doc_id": resolved_doc_id,
@@ -2134,7 +2160,7 @@ async def upload(
                     "mime_type": file.content_type,
                     "size_bytes": len(raw),
                     "status": "uploaded_only",
-                    "parse_summary": "Uploaded only; install pypdf to enable PDF auto-ingest",
+                    "parse_summary": "Uploaded only; install opendataloader-pdf (and Java 11+) to enable PDF auto-ingest",
                     "parse_provider": parser_mode,
                 }
             )
@@ -2142,7 +2168,7 @@ async def upload(
                 filename=original_name,
                 stored_path=str(stored_path),
                 status="uploaded_only",
-                message="文件已上传，但当前环境缺少 pypdf，无法自动解析 PDF。请安装后重试。",
+                message="文件已上传，但当前环境缺少 opendataloader-pdf 或 Java 运行时，无法自动解析 PDF。请安装后重试。",
                 collection_name=collection_name,
                 doc_language=doc_language,
                 doc_id=resolved_doc_id,
@@ -2203,7 +2229,7 @@ async def upload(
                 f"Queued for indexing ({parser_mode}, remote_error={remote_parse_warning[:220]}, "
                 f"pdf pages={page_count}, empty_pages={empty_pages})"
             )
-            response_message = "文件已上传；远端解析失败，已自动回退本地 pypdf 并进入入库队列。"
+            response_message = "文件已上传；远端解析失败，已自动回退本地 opendataloader-pdf 并进入入库队列。"
 
         _upsert_document_registry(
             {

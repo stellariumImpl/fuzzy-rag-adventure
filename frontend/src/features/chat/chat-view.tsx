@@ -1,5 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUp, Globe, MessageSquare, Plus, Upload, X } from "lucide-react";
+import {
+  ArrowUp,
+  Check,
+  Copy,
+  Globe,
+  MessageSquare,
+  Pencil,
+  Plus,
+  RotateCcw,
+  ThumbsDown,
+  ThumbsUp,
+  Upload,
+  X,
+} from "lucide-react";
 import { HintIconButton } from "../../components/hint-icon-button";
 import { ThinkingPanel } from "./thinking-panel";
 import { DocumentThumbnail } from "../workspace/components/document-thumbnail";
@@ -45,6 +58,19 @@ const handleDropUpload = (
   void onUploadPickedFile(file);
 };
 
+const formatScore = (value: number | null | undefined): string => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return value.toFixed(4);
+};
+
+const normalizeSourceType = (value: string): string => {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "-";
+  return normalized.replace(/_/g, " ");
+};
+
+type FeedbackState = "up" | "down" | null;
+
 export function ChatView({
   chatStarted,
   documents,
@@ -68,7 +94,11 @@ export function ChatView({
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const autoStickToBottomRef = useRef(true);
   const documentPickerRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const copyResetTimerRef = useRef<number | null>(null);
   const [documentPickerOpen, setDocumentPickerOpen] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [feedbackByMessage, setFeedbackByMessage] = useState<Record<string, FeedbackState>>({});
 
   const latestMessage = useMemo(
     () => (messages.length > 0 ? messages[messages.length - 1] : null),
@@ -108,6 +138,15 @@ export function ChatView({
   }, [messages, latestMessage, isAssistantStreaming]);
 
   useEffect(() => {
+    return () => {
+      if (copyResetTimerRef.current != null) {
+        window.clearTimeout(copyResetTimerRef.current);
+        copyResetTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!documentPickerOpen) return;
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target as Node | null;
@@ -121,6 +160,69 @@ export function ChatView({
       window.removeEventListener("pointerdown", handlePointerDown);
     };
   }, [documentPickerOpen]);
+
+  const focusComposerWithText = (text: string) => {
+    const next = String(text || "").trim();
+    if (!next) return;
+    onInputValueChange(next);
+    window.requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (!el) return;
+      el.focus();
+      const cursor = next.length;
+      el.setSelectionRange(cursor, cursor);
+    });
+  };
+
+  const promptForMessage = (messageIndex: number): string => {
+    const current = messages[messageIndex];
+    if (!current) return "";
+    if (current.role === "user") return current.content.trim();
+    for (let i = messageIndex - 1; i >= 0; i -= 1) {
+      const candidate = messages[i];
+      if (candidate.role === "user" && candidate.content.trim().length > 0) {
+        return candidate.content.trim();
+      }
+    }
+    return "";
+  };
+
+  const copyText = async (messageId: string, value: string) => {
+    const text = String(value || "").trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "true");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+    }
+
+    setCopiedMessageId(messageId);
+    if (copyResetTimerRef.current != null) {
+      window.clearTimeout(copyResetTimerRef.current);
+    }
+    copyResetTimerRef.current = window.setTimeout(() => {
+      setCopiedMessageId((previous) => (previous === messageId ? null : previous));
+      copyResetTimerRef.current = null;
+    }, 1200);
+  };
+
+  const toggleFeedback = (messageId: string, target: Exclude<FeedbackState, null>) => {
+    setFeedbackByMessage((previous) => {
+      const current = previous[messageId] ?? null;
+      return {
+        ...previous,
+        [messageId]: current === target ? null : target,
+      };
+    });
+  };
 
   return (
     <section className="relative flex min-h-0 flex-1 flex-col px-6 pb-5 pt-8">
@@ -236,89 +338,211 @@ export function ChatView({
           )
         ) : (
           <div className="mx-auto flex min-h-full w-full max-w-[980px] flex-col gap-4 pr-1">
-            {messages.map((message) => (
-              <div
-                key={message.id}
-                className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
-              >
-                <div
-                  className={`whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm leading-6 ${
-                    message.role === "user"
-                      ? "max-w-[72%] bg-[#2a2a2a] text-white"
-                      : "max-w-full bg-[#1a1a1a] text-[#d9dce3]"
-                  }`}
-                >
-                  {message.role === "assistant" && message.debug && (
-                    <ThinkingPanel
-                      debug={message.debug}
-                      isStreaming={message.content.trim().length === 0}
-                    />
-                  )}
-                  {message.role === "user" && Array.isArray(message.attachments) && message.attachments.length > 0 && (
-                    <div className="mb-2 flex flex-wrap gap-1.5">
-                      {message.attachments.map((attachment) => (
-                        <span
-                          key={`${message.id}-${attachment.docId}`}
-                          className="inline-flex max-w-[280px] items-center gap-1 rounded-full border border-[#4d5565] bg-[#202632] px-2 py-0.5 text-[11px] text-[#d3d8e3]"
-                          title={attachment.name}
-                        >
-                          <span className="truncate">{attachment.name}</span>
-                          {attachment.pages != null && attachment.pages > 0 && (
-                            <span className="text-[#9ca6b8]">{attachment.pages}p</span>
-                          )}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                  {message.content.trim().length > 0 ? (
-                    message.content
-                  ) : message.role === "assistant" ? (
-                    message.debug ? null : <span className="text-[#99a9bc]">Thinking...</span>
-                  ) : (
-                    message.content
-                  )}
+            {messages.map((message, messageIndex) => {
+              const trimmedContent = message.content.trim();
+              const bubbleContent =
+                trimmedContent.length > 0 ? (
+                  message.content
+                ) : message.role === "assistant" ? (
+                  message.debug ? null : <span className="text-[#99a9bc]">Thinking...</span>
+                ) : (
+                  message.content
+                );
+              const showTextBubble = bubbleContent !== null;
 
-                  {message.role === "assistant" &&
-                    Array.isArray(message.citations) &&
-                    message.citations.length > 0 && (
-                      <div className="mt-3 rounded-xl border border-[#2f3a4e] bg-[#111827] p-3">
-                        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.08em] text-[#93a4be]">
-                          Sources
-                        </p>
-                        <div className="space-y-2">
-                          {message.citations.map((c, idx) => (
-                            <div
-                              key={`${message.id}-cite-${idx}`}
-                              className="rounded-lg border border-[#2e3b51] bg-[#0f1726] p-2.5"
-                            >
-                              <div className="flex items-center gap-2 text-xs">
-                                <span className="inline-flex rounded bg-[#25344f] px-1.5 py-0.5 font-semibold text-[#b9d3ff]">
-                                  [{c.index}]
-                                </span>
-                                <span className="font-semibold text-white">
-                                  {c.source_name || c.doc_id || "unknown"}
-                                </span>
-                              </div>
-                              {c.heading_path ? (
-                                <p className="mt-1 text-[11px] text-[#9fb0c9]">{c.heading_path}</p>
-                              ) : null}
-                              <p className="mt-1.5 text-[12px] leading-5 text-[#ced7e6]">
-                                {c.snippet || "(no snippet)"}
-                              </p>
-                              <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-[#8ea0ba]">
-                                <span>source: {c.source_type || "-"}</span>
-                                <span>chunk: {c.chunk_index}</span>
-                                <span>rerank: {c.rerank_score ?? "-"}</span>
-                                <span>rrf: {c.rrf_score ?? "-"}</span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
+              return (
+                <div
+                  key={message.id}
+                  className={`group flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`flex flex-col gap-2 ${
+                      message.role === "user" ? "max-w-[72%] items-end" : "w-full max-w-full items-start"
+                    }`}
+                  >
+                    {message.role === "assistant" && message.debug && (
+                      <div className="w-full">
+                        <ThinkingPanel
+                          debug={message.debug}
+                          isStreaming={trimmedContent.length === 0}
+                        />
                       </div>
                     )}
+
+                    {message.role === "user" &&
+                      Array.isArray(message.attachments) &&
+                      message.attachments.length > 0 && (
+                        <div className="flex flex-wrap justify-end gap-1.5">
+                          {message.attachments.map((attachment) => (
+                            <span
+                              key={`${message.id}-${attachment.docId}`}
+                              className="inline-flex max-w-[280px] items-center gap-1 rounded-full border border-[#4d5565] bg-[#202632] px-2 py-0.5 text-[11px] text-[#d3d8e3]"
+                              title={attachment.name}
+                            >
+                              <span className="truncate">{attachment.name}</span>
+                              {attachment.pages != null && attachment.pages > 0 && (
+                                <span className="text-[#9ca6b8]">{attachment.pages}p</span>
+                              )}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                    {showTextBubble && (
+                      <div
+                        className={`whitespace-pre-wrap break-words rounded-2xl px-4 py-3 text-sm leading-6 ${
+                          message.role === "user"
+                            ? "bg-[#2a2a2a] text-white"
+                            : "bg-[#1a1a1a] text-[#d9dce3]"
+                        }`}
+                      >
+                        {bubbleContent}
+                      </div>
+                    )}
+
+                    {message.role === "assistant" &&
+                      Array.isArray(message.citations) &&
+                      message.citations.length > 0 && (
+                        <div className="w-full rounded-xl border border-[#2f3a4e] bg-[#111827] p-3">
+                          <div className="mb-2.5 flex items-center justify-between">
+                            <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#93a4be]">
+                              Sources
+                            </p>
+                            <span className="rounded-md border border-[#2e3b51] bg-[#0f1726] px-2 py-0.5 text-[11px] font-semibold text-[#b6c7df]">
+                              {message.citations.length}
+                            </span>
+                          </div>
+                          <div className="max-h-[420px] space-y-2.5 overflow-y-auto pr-1">
+                            {message.citations.map((c, idx) => (
+                              <article
+                                key={`${message.id}-cite-${idx}`}
+                                className="group rounded-lg border border-[#2e3b51] bg-[#0f1726] p-2.5 transition-colors hover:bg-[#111b2d]"
+                              >
+                                <div className="flex items-start gap-2">
+                                  <span className="mt-0.5 inline-flex rounded bg-[#25344f] px-1.5 py-0.5 text-xs font-semibold text-[#b9d3ff]">
+                                    [{c.index}]
+                                  </span>
+                                  <div className="min-w-0 flex-1">
+                                    <p
+                                      className="truncate text-[13px] font-semibold text-white"
+                                      title={c.source_name || c.doc_id || "unknown"}
+                                    >
+                                      {c.source_name || c.doc_id || "unknown"}
+                                    </p>
+                                    {c.heading_path ? (
+                                      <p
+                                        className="mt-0.5 truncate text-[11px] text-[#9fb0c9]"
+                                        title={c.heading_path}
+                                      >
+                                        {c.heading_path}
+                                      </p>
+                                    ) : null}
+                                  </div>
+                                </div>
+                                <p
+                                  className="source-snippet mt-2 text-[12px] leading-5 text-[#ced7e6]"
+                                  title={c.snippet || "(no snippet)"}
+                                >
+                                  {c.snippet || "(no snippet)"}
+                                </p>
+                                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-[#8ea0ba]">
+                                  <span className="rounded-md border border-[#2f3a4f] bg-[#121b2d] px-1.5 py-0.5">
+                                    source: {normalizeSourceType(c.source_type)}
+                                  </span>
+                                  <span className="rounded-md border border-[#2f3a4f] bg-[#121b2d] px-1.5 py-0.5">
+                                    chunk: {c.chunk_index >= 0 ? c.chunk_index : "-"}
+                                  </span>
+                                  <span className="rounded-md border border-[#2f3a4f] bg-[#121b2d] px-1.5 py-0.5">
+                                    rerank: {formatScore(c.rerank_score)}
+                                  </span>
+                                  <span className="rounded-md border border-[#2f3a4f] bg-[#121b2d] px-1.5 py-0.5">
+                                    rrf: {formatScore(c.rrf_score)}
+                                  </span>
+                                </div>
+                              </article>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                    <div
+                      className={`message-actions mt-1 flex items-center gap-1.5 opacity-0 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 ${
+                        message.role === "user" ? "justify-end" : "justify-start"
+                      }`}
+                    >
+                      <div className="inline-flex items-center gap-1">
+                        <button
+                          type="button"
+                          aria-label="Copy message"
+                          className="message-action-btn h-8 w-8 rounded-lg bg-transparent text-[#b4bfce] hover:text-white"
+                          onClick={() => {
+                            void copyText(message.id, message.content);
+                          }}
+                        >
+                          {copiedMessageId === message.id ? <Check size={15} /> : <Copy size={15} />}
+                        </button>
+
+                        {message.role === "assistant" ? (
+                          <>
+                            <button
+                              type="button"
+                              aria-label="Like answer"
+                              className={`message-action-btn h-8 w-8 rounded-lg bg-transparent hover:text-white ${
+                                feedbackByMessage[message.id] === "up"
+                                  ? "is-active text-[#8dc1ff]"
+                                  : "text-[#b4bfce]"
+                              }`}
+                              onClick={() => {
+                                toggleFeedback(message.id, "up");
+                              }}
+                            >
+                              <ThumbsUp size={15} />
+                            </button>
+
+                            <button
+                              type="button"
+                              aria-label="Dislike answer"
+                              className={`message-action-btn h-8 w-8 rounded-lg bg-transparent hover:text-white ${
+                                feedbackByMessage[message.id] === "down"
+                                  ? "is-active text-[#ff7c8f]"
+                                  : "text-[#b4bfce]"
+                              }`}
+                              onClick={() => {
+                                toggleFeedback(message.id, "down");
+                              }}
+                            >
+                              <ThumbsDown size={15} />
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            aria-label="Edit question"
+                            className="message-action-btn h-8 w-8 rounded-lg bg-transparent text-[#b4bfce] hover:text-white"
+                            onClick={() => {
+                              focusComposerWithText(message.content);
+                            }}
+                          >
+                            <Pencil size={15} />
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          aria-label="Reuse prompt"
+                          className="message-action-btn h-8 w-8 rounded-lg bg-transparent text-[#b4bfce] hover:text-white"
+                          onClick={() => {
+                            focusComposerWithText(promptForMessage(messageIndex));
+                          }}
+                        >
+                          <RotateCcw size={15} />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
@@ -359,6 +583,7 @@ export function ChatView({
           )}
 
           <textarea
+            ref={composerRef}
             value={inputValue}
             onChange={(event) => onInputValueChange(event.target.value)}
             onKeyDown={onComposerKeyDown}

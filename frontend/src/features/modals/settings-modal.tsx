@@ -1047,7 +1047,7 @@ export function SettingsModal({
                     </label>
 
                     <p className={`text-[12px] ${labelTone}`}>
-                      仅当开关开启且 `JOB_URL`、`TOKEN`、`MODEL` 都配置后，上传 PDF 才会走远端解析；否则回退到本地 `pypdf`。
+                      仅当开关开启且 `JOB_URL`、`TOKEN`、`MODEL` 都配置后，上传 PDF 才会走远端解析；否则回退到本地 `opendataloader-pdf`。
                     </p>
                   </div>
 
