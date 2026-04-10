@@ -122,7 +122,7 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState("");
   const [chatStarted, setChatStarted] = useState(false);
-  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [inferenceEnabled, setInferenceEnabled] = useState(false);
 
   const [chatThreads, setChatThreads] = useState<ChatThreadItem[]>([]);
   const [chatListLoading, setChatListLoading] = useState(false);
@@ -506,6 +506,8 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
       replaceTarget?: {
         userMessageId: string;
         assistantMessageId?: string | null;
+        userContent?: string | null;
+        assistantContent?: string | null;
       };
       shouldAutoTitle: boolean;
     }) => {
@@ -581,12 +583,14 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
       setChatStarted(true);
 
       try {
+        const answerMode = inferenceEnabled ? "inference" : "strict";
         const reply = await requestAssistantReply(
           userInput,
           [...messages, userMessage],
           {
             threadId: activeThreadId,
             selectedDocIds: params.selectedDocIds,
+            answerMode,
           },
           (streamEvent) => {
             if (streamEvent.type === "debug") {
@@ -755,6 +759,8 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
           const detail = await replaceChatTurnWithLatest(resolvedForTitle, {
             target_user_message_id: params.replaceTarget.userMessageId,
             target_assistant_message_id: params.replaceTarget.assistantMessageId ?? null,
+            target_user_content: params.replaceTarget.userContent ?? null,
+            target_assistant_content: params.replaceTarget.assistantContent ?? null,
           });
           setMessages(detail.messages.map(toChatMessage));
         }
@@ -785,6 +791,7 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
       activeThreadId,
       chatThreads,
       generateChatTitle,
+      inferenceEnabled,
       messages,
       persistActiveThread,
       refreshChatThreads,
@@ -861,6 +868,9 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
           userMessageId: turn.userMessage.id,
           assistantMessageId:
             turn.assistantIndex != null ? messages[turn.assistantIndex]?.id : null,
+          userContent: turn.userMessage.content,
+          assistantContent:
+            turn.assistantIndex != null ? messages[turn.assistantIndex]?.content ?? "" : null,
         },
         shouldAutoTitle: false,
       });
@@ -894,8 +904,8 @@ export function useChatSession({ documents, documentsById, pushToast }: UseChatS
     setInputValue,
     chatStarted,
     setChatStarted,
-    webSearchEnabled,
-    setWebSearchEnabled,
+    inferenceEnabled,
+    setInferenceEnabled,
     toggleDocumentSelection,
     removeDocumentFromSelection,
     handleSend,

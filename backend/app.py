@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -510,6 +510,7 @@ class AnswerRequest(BaseModel):
     top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=50)
     table_records_path: str | None = None
     selected_doc_ids: list[str] | None = None
+    answer_mode: Literal["strict", "inference"] = "strict"
 
 
 class AnswerResponse(BaseModel):
@@ -551,6 +552,8 @@ class ChatThreadAppendMessagesRequest(BaseModel):
 class ChatThreadReplaceTurnRequest(BaseModel):
     target_user_message_id: str
     target_assistant_message_id: str | None = None
+    target_user_content: str | None = None
+    target_assistant_content: str | None = None
 
 
 class UploadResponse(BaseModel):
@@ -3238,6 +3241,16 @@ def replace_chat_turn_with_latest(
                     old_user_index = index
                     break
             if old_user_index < 0:
+                target_user_content = str(req.target_user_content or "").strip()
+                if target_user_content:
+                    for index in range(len(base) - 1, -1, -1):
+                        item = base[index]
+                        if item["role"] != "user":
+                            continue
+                        if str(item.get("content") or "").strip() == target_user_content:
+                            old_user_index = index
+                            break
+            if old_user_index < 0:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Target user message not found: {req.target_user_message_id}",
@@ -3254,6 +3267,16 @@ def replace_chat_turn_with_latest(
                 )
             ):
                 delete_count = 2
+            elif (
+                adjacent is not None
+                and adjacent["role"] == "assistant"
+            ):
+                target_assistant_content = str(req.target_assistant_content or "").strip()
+                if (
+                    target_assistant_content
+                    and str(adjacent.get("content") or "").strip() == target_assistant_content
+                ):
+                    delete_count = 2
             elif req.target_assistant_message_id:
                 explicit_assistant_index = next(
                     (
@@ -3467,6 +3490,7 @@ def _build_answer_tool_events(
                 "doc_language": req.doc_language,
                 "top_k": req.top_k,
                 "selected_doc_ids": selected_doc_ids,
+                "answer_mode": req.answer_mode,
             },
             "result": {
                 "result_count": len(retrieval_results),
@@ -3500,6 +3524,7 @@ def _build_answer_tool_events(
             "parameters": {
                 "model": str(os.environ.get("LLM_MODEL") or "gpt-4o"),
                 "context_chunk_count": len(retrieval_results),
+                "answer_mode": req.answer_mode,
             },
             "result": {
                 "answer_char_count": len(answer_text),
@@ -3542,6 +3567,7 @@ def answer(req: AnswerRequest) -> AnswerResponse:
         top_k=req.top_k,
         selected_doc_ids=selected_doc_ids,
         stream=False,
+        answer_mode=req.answer_mode,
     )
 
     # Enrich retrieval/sources with stable source_name so frontend labels are

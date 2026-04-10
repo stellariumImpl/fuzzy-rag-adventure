@@ -10,6 +10,7 @@ export type AssistantChatMessage = {
   debug?: {
     question?: string;
     selected_doc_ids?: string[];
+    answer_mode?: "strict" | "inference";
     startedAt?: number;
     completedAt?: number;
     statusText?: string;
@@ -50,6 +51,7 @@ export type AssistantStreamEvent =
 export type AssistantReplyOptions = {
   threadId?: string | null;
   selectedDocIds?: string[];
+  answerMode?: "strict" | "inference";
 };
 
 export type AssistantReplyResult = {
@@ -194,6 +196,7 @@ export const requestAssistantReply = async (
 ): Promise<AssistantReplyResult> => {
   const startedAt = Date.now();
   const selectedDocIds = options?.selectedDocIds ?? [];
+  const answerMode = options?.answerMode ?? "strict";
   const collectedDebugEvents: AssistantDebugEvent[] = [];
 
   onStreamEvent?.({ type: "ready" });
@@ -210,6 +213,7 @@ export const requestAssistantReply = async (
       doc_language: ANSWER_DOC_LANGUAGE,
       top_k: ANSWER_TOP_K,
       selected_doc_ids: selectedDocIds,
+      answer_mode: answerMode,
     }),
   });
 
@@ -242,6 +246,7 @@ export const requestAssistantReply = async (
     startedAt,
     completedAt: Date.now(),
     statusText: "completed",
+    answer_mode: answerMode,
     events: collectedDebugEvents,
   };
 

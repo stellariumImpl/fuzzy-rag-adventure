@@ -24,6 +24,7 @@ This backend wraps the existing notebook pipeline into stable API endpoints.
 - `GET /tasks/{task_id}`
 - `POST /search`
 - `POST /answer`
+  - Optional payload field: `answer_mode` (`strict` | `inference`, default `strict`)
 
 ## Run
 

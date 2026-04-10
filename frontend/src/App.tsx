@@ -109,8 +109,8 @@ export default function App() {
     setInputValue,
     chatStarted,
     setChatStarted,
-    webSearchEnabled,
-    setWebSearchEnabled,
+    inferenceEnabled,
+    setInferenceEnabled,
     toggleDocumentSelection,
     removeDocumentFromSelection,
     handleSend,
@@ -322,7 +322,7 @@ export default function App() {
               selectedDocuments={selectedDocuments}
               messages={messages}
               inputValue={inputValue}
-              webSearchEnabled={webSearchEnabled}
+              inferenceEnabled={inferenceEnabled}
               onSetQuickUploadDragOver={setQuickUploadDragOver}
               onUploadPickedFile={(file) => handleUploadPickedFile(file, "root")}
               onOpenUploadFilePicker={() => openUploadFilePicker("root")}
@@ -330,7 +330,7 @@ export default function App() {
               onRemoveDocumentFromSelection={removeDocumentFromSelection}
               onInputValueChange={setInputValue}
               onComposerKeyDown={handleKeyDown}
-              onToggleWebSearch={() => setWebSearchEnabled((previous) => !previous)}
+              onToggleInference={() => setInferenceEnabled((previous) => !previous)}
               onSend={handleSend}
               onEditMessage={handleEditMessage}
               onRetryMessage={handleRetryMessage}

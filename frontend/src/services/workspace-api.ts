@@ -597,6 +597,8 @@ export async function replaceChatTurnWithLatest(
   payload: {
     target_user_message_id: string;
     target_assistant_message_id?: string | null;
+    target_user_content?: string | null;
+    target_assistant_content?: string | null;
   },
 ) {
   return request<ChatThreadDetail>(

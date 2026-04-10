@@ -51,7 +51,7 @@ interface ChatViewProps {
   selectedDocuments: DocumentItem[];
   messages: ChatMessage[];
   inputValue: string;
-  webSearchEnabled: boolean;
+  inferenceEnabled: boolean;
   onSetQuickUploadDragOver: (value: boolean) => void;
   onUploadPickedFile: (file: File) => Promise<void>;
   onOpenUploadFilePicker: () => void;
@@ -59,7 +59,7 @@ interface ChatViewProps {
   onRemoveDocumentFromSelection: (docId: string) => void;
   onInputValueChange: (value: string) => void;
   onComposerKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
-  onToggleWebSearch: () => void;
+  onToggleInference: () => void;
   onSend: () => Promise<void>;
   onEditMessage: (messageIndex: number) => void;
   onRetryMessage: (messageIndex: number) => Promise<void>;
@@ -231,7 +231,7 @@ export function ChatView({
   selectedDocuments,
   messages,
   inputValue,
-  webSearchEnabled,
+  inferenceEnabled,
   onSetQuickUploadDragOver,
   onUploadPickedFile,
   onOpenUploadFilePicker,
@@ -239,7 +239,7 @@ export function ChatView({
   onRemoveDocumentFromSelection,
   onInputValueChange,
   onComposerKeyDown,
-  onToggleWebSearch,
+  onToggleInference,
   onSend,
   onEditMessage,
   onRetryMessage,
@@ -1387,14 +1387,14 @@ export function ChatView({
               </div>
 
               <HintIconButton
-                label="Web search"
-                hint="Web search"
+                label="Inference"
+                hint="Inference"
                 wrapperClassName="composer-hint"
                 className={`composer-websearch-btn rounded-full p-2 ${
-                  webSearchEnabled ? "is-active" : ""
+                  inferenceEnabled ? "is-active" : ""
                 }`}
-                pressed={webSearchEnabled}
-                onClick={onToggleWebSearch}
+                pressed={inferenceEnabled}
+                onClick={onToggleInference}
               >
                 <Globe size={16} />
               </HintIconButton>

@@ -4,7 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 try:
     from .embedding import get_embedder
@@ -107,6 +107,7 @@ class RAGService:
         top_k: int | None = None,
         selected_doc_ids: list[str] | None = None,
         stream: bool = False,
+        answer_mode: Literal["strict", "inference"] = "strict",
     ) -> dict[str, Any]:
         """
         生成最终答案，返回结构：
@@ -136,6 +137,7 @@ class RAGService:
             question=question,
             results=search_out.results,
             stream=stream,
+            answer_mode=answer_mode,
         )
         return {
             "question": question,
