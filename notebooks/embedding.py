@@ -418,7 +418,7 @@ def upsert_chunks(
 
     # 构造用于 embedding 的文本：heading_path 提供上下文，content 提供语义
     texts_to_embed = [
-        f"{c['heading_path']}\n\n{c['content']}"
+        f"{c.get('heading_path', '')}\n\n{c.get('content', '')}"
         for c in chunks
     ]
 
@@ -440,8 +440,14 @@ def upsert_chunks(
                 payload={
                     "doc_id":       doc_id,
                     "chunk_index":  i,
-                    "heading_path": chunks[i]["heading_path"],
-                    "content":      chunks[i]["content"],   # 原文，检索后直接返回
+                    "heading_path": chunks[i].get("heading_path", ""),
+                    "content":      chunks[i].get("content", ""),   # 原文，检索后直接返回
+                    "chunk_type":   chunks[i].get("type", "text"),
+                    "image_path":   chunks[i].get("image_path", ""),
+                    "image_rel_path": chunks[i].get("image_rel_path", ""),
+                    "image_category": chunks[i].get("image_category", ""),
+                    "image_sha256": chunks[i].get("image_sha256", ""),
+                    "page":         chunks[i].get("page"),
                 },
             )
         )

@@ -21,13 +21,26 @@ export const formatUploadDate = (uploadedAt: string): string => {
   });
 };
 
-export const isPlaceholderDocumentDescription = (value: string): boolean => {
+const normalizeDescriptionToken = (value: string): string =>
+  value.trim().replace(/\s+/g, " ").toLowerCase();
+
+const sourceNameStem = (sourceName?: string): string =>
+  (sourceName || "").replace(/\.[a-zA-Z0-9]+$/, "").trim();
+
+export const isPlaceholderDocumentDescription = (
+  value: string,
+  sourceName?: string,
+): boolean => {
   const normalized = value.trim().toLowerCase();
-  return normalized.length === 0 || normalized === "uploaded document";
+  if (normalized.length === 0 || normalized === "uploaded document") return true;
+  const stem = normalizeDescriptionToken(sourceNameStem(sourceName));
+  return stem.length > 0 && normalizeDescriptionToken(value) === stem;
 };
 
-export const getDocumentDescriptionLabel = (value: string): string =>
-  isPlaceholderDocumentDescription(value) ? "No description yet." : value;
+export const getDocumentDescriptionLabel = (
+  value: string,
+  sourceName?: string,
+): string => (isPlaceholderDocumentDescription(value, sourceName) ? "No description yet." : value);
 
 export const getDocumentThumbnailUrl = (docId: string, width: number): string =>
   `${WORKSPACE_API_BASE_URL}/documents/${encodeURIComponent(docId)}/thumbnail?width=${width}&v=content`;

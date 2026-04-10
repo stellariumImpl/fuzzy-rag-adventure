@@ -64,14 +64,22 @@ def main() -> None:
     )
     model = os.environ.get("LLM_MODEL", "gpt-4o")
 
-    processed = process_markdown_text(raw_text, client=client, model=model)
+    processed = process_markdown_text(
+        raw_text,
+        client=client,
+        model=model,
+        pages=pages,
+        output_dir=output_dir,
+    )
     text_chunks = processed["text_chunks"]
+    image_chunks = processed.get("image_chunks", [])
     table_records = processed["table_records"]
+    indexed_chunks = text_chunks + image_chunks
 
     doc_id = args.doc_id or output_dir.name
     embedder = get_embedder(args.doc_language)
     upsert_chunks(
-        chunks=text_chunks,
+        chunks=indexed_chunks,
         embedder=embedder,
         collection_name=args.collection,
         doc_id=doc_id,
@@ -84,6 +92,10 @@ def main() -> None:
             json.dumps(text_chunks, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        (output_dir / "image_chunks.json").write_text(
+            json.dumps(image_chunks, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         (output_dir / "table_records.json").write_text(
             json.dumps(table_records, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -94,7 +106,8 @@ def main() -> None:
         )
 
     print(
-        f"[done] pages={len(pages)} text_chunks={len(text_chunks)} table_records={len(table_records)} "
+        f"[done] pages={len(pages)} text_chunks={len(text_chunks)} image_chunks={len(image_chunks)} "
+        f"table_records={len(table_records)} "
         f"collection={args.collection} doc_id={doc_id}"
     )
 

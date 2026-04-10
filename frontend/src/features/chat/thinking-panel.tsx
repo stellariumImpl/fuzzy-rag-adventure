@@ -1,23 +1,54 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 import type { ChatMessage } from "../workspace/models";
 
-type ThoughtEvent = NonNullable<NonNullable<ChatMessage["debug"]>["events"]>[number];
+type ThoughtEvent = NonNullable<
+  NonNullable<ChatMessage["debug"]>["events"]
+>[number];
 
 interface ThinkingPanelProps {
   debug: NonNullable<ChatMessage["debug"]>;
   isStreaming: boolean;
 }
 
-const toNumber = (value: unknown): number | null => {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+type ToolEventView = {
+  key: string;
+  title: string;
+  parameters: unknown;
+  result: unknown;
+  at: string | null;
 };
+
+const TOOL_META_KEYS = new Set([
+  "tool_name",
+  "tool",
+  "name",
+  "operation",
+  "action",
+  "title",
+  "parameters",
+  "params",
+  "arguments",
+  "args",
+  "result",
+  "output",
+  "response",
+]);
 
 const safeText = (value: unknown): string => {
   if (typeof value === "string") return value;
   if (value == null) return "";
   return String(value);
+};
+
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
 };
 
 const formatSeconds = (ms: number): string => {
@@ -26,42 +57,95 @@ const formatSeconds = (ms: number): string => {
   return `${Math.round(ms / 1000)}s`;
 };
 
-const safeJson = (value: unknown): string => {
+const formatIsoTime = (value: number | undefined): string | null => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  try {
+    return new Date(value).toISOString();
+  } catch {
+    return null;
+  }
+};
+
+const jsonBlock = (value: unknown): string => {
+  if (value === undefined) return "{}";
   try {
     return JSON.stringify(value, null, 2);
   } catch {
-    return String(value);
+    return JSON.stringify(String(value), null, 2);
   }
 };
 
-const normalizeStageName = (rawStage: string): string => {
-  const stage = rawStage.trim().toLowerCase();
-  if (stage === "retrieve") return "retrieval";
-  if (stage === "notebook-recursive" || stage === "recursive-rag") return "retrieval";
-  return rawStage;
+const isSyntheticRetrievalEvent = (
+  title: string,
+  data: Record<string, unknown> | null,
+): boolean => {
+  const normalized = title.trim().toLowerCase();
+  if (normalized !== "top recalled chunks") return false;
+  if (!data) return false;
+  return (
+    Object.prototype.hasOwnProperty.call(data, "total_hits") &&
+    Object.prototype.hasOwnProperty.call(data, "top_hits")
+  );
 };
 
-const mapThoughtLine = (event: ThoughtEvent, index: number): string => {
-  const rawStage = safeText(event.stage || "unknown");
-  const normalizedStage = normalizeStageName(rawStage);
-  const stageLabel =
-    normalizedStage === rawStage
-      ? normalizedStage
-      : `${normalizedStage} (raw: ${rawStage})`;
-  const label = `[${index + 1}] stage=${stageLabel}`;
-  const detail = safeText(event.detail || "").trim();
-  const hasData = event.data !== undefined;
-  const dataText = hasData ? safeJson(event.data) : "";
-  if (hasData) {
-    return `${label}\n${detail || "(no detail)"}\n${dataText}`;
+const toToolEvent = (
+  event: ThoughtEvent,
+  index: number,
+): ToolEventView | null => {
+  const data = asRecord(event.data);
+
+  const titleCandidates = [
+    safeText(data?.tool_name),
+    safeText(data?.tool),
+    safeText(data?.name),
+    safeText(data?.operation),
+    safeText(data?.action),
+    safeText(data?.title),
+    safeText(event.detail),
+    safeText(event.stage),
+  ]
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+
+  const title = titleCandidates[0] ?? "";
+  if (!title) return null;
+  if (isSyntheticRetrievalEvent(title, data)) return null;
+
+  const parameters =
+    data?.parameters ?? data?.params ?? data?.arguments ?? data?.args;
+
+  let result = data?.result ?? data?.output ?? data?.response;
+
+  if (result === undefined && data) {
+    const entries = Object.entries(data).filter(
+      ([key]) => !TOOL_META_KEYS.has(key),
+    );
+    if (entries.length > 0) {
+      result = Object.fromEntries(entries);
+    }
   }
-  return `${label}\n${detail || "(no detail)"}`;
+
+  if (parameters === undefined && result === undefined) return null;
+
+  return {
+    key: `${index}-${safeText(event.at)}-${title}`,
+    title,
+    parameters: parameters ?? {},
+    result: result ?? {},
+    at: formatIsoTime(event.at),
+  };
 };
 
 const SpinnerOrCheck = ({ done }: { done: boolean }) => {
   if (done) {
     return (
-      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 14 14"
+        fill="none"
+        aria-hidden="true"
+      >
         <circle cx="7" cy="7" r="6" stroke="#2d6f52" strokeWidth="1" />
         <path
           d="M4 7l2 2 4-4"
@@ -75,194 +159,169 @@ const SpinnerOrCheck = ({ done }: { done: boolean }) => {
   }
 
   return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 14 14"
-      fill="none"
-      aria-hidden="true"
-      className="animate-spin"
-    >
-      <circle cx="7" cy="7" r="5.5" stroke="#43516a" strokeWidth="1.5" />
-      <path d="M7 1.5A5.5 5.5 0 0 1 12.5 7" stroke="#9dc1e8" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
+    <span className="claude-loader" aria-hidden="true">
+      <span />
+      <span />
+      <span />
+    </span>
   );
 };
 
 export function ThinkingPanel({ debug, isStreaming }: ThinkingPanelProps) {
   const events = debug.events ?? [];
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const bodyRef = useRef<HTMLDivElement | null>(null);
-  const appendedCountRef = useRef(0);
-  const queueRef = useRef<string[]>([]);
-  const typingTimerRef = useRef<number | null>(null);
-  const currentChunkRef = useRef<string>("");
-  const userScrolledRef = useRef(false);
-  const [open, setOpen] = useState(isStreaming);
+  const done = !isStreaming;
+  const hasEvents = events.length > 0;
 
-  const startedAt = debug.startedAt ?? events.find((event) => event.at != null)?.at;
+  const [open, setOpen] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
+  const startedAt =
+    debug.startedAt ?? events.find((event) => event.at != null)?.at;
   const completedAt = debug.completedAt;
   const elapsedMs = useMemo(() => {
     if (startedAt == null) return 0;
-    return Math.max(0, (completedAt ?? Date.now()) - startedAt);
-  }, [completedAt, startedAt, isStreaming, events.length]);
+    return Math.max(0, (completedAt ?? nowTick) - startedAt);
+  }, [completedAt, startedAt, nowTick]);
 
-  const done = !isStreaming;
-  const hasEvents = events.length > 0;
-  const summaryText = done
-    ? `Retrieval log · ${formatSeconds(elapsedMs)}`
-    : "Running retrieval pipeline…";
-
-  const maybeScrollBottom = () => {
-    const body = bodyRef.current;
-    if (!body || userScrolledRef.current) return;
-    body.scrollTop = body.scrollHeight;
-  };
-
-  const stopTypingTimer = () => {
-    if (typingTimerRef.current != null) {
-      window.clearInterval(typingTimerRef.current);
-      typingTimerRef.current = null;
-    }
-  };
-
-  const flushAllNow = () => {
-    const target = bodyRef.current;
-    if (!target) return;
-    stopTypingTimer();
-
-    if (currentChunkRef.current.length > 0) {
-      target.append(document.createTextNode(currentChunkRef.current));
-      currentChunkRef.current = "";
-    }
-
-    while (queueRef.current.length > 0) {
-      const chunk = queueRef.current.shift();
-      if (chunk) target.append(document.createTextNode(chunk));
-    }
-    maybeScrollBottom();
-  };
-
-  const pumpTyping = () => {
-    if (typingTimerRef.current != null) return;
-    const body = bodyRef.current;
-    if (!body) return;
-
-    const nextChunk = () => {
-      if (currentChunkRef.current.length > 0) return true;
-      const queued = queueRef.current.shift();
-      if (!queued) return false;
-      currentChunkRef.current = queued;
-      return true;
-    };
-
-    if (!nextChunk()) return;
-
-    typingTimerRef.current = window.setInterval(() => {
-      const target = bodyRef.current;
-      if (!target) {
-        stopTypingTimer();
-        return;
-      }
-
-      if (currentChunkRef.current.length === 0) {
-        const hasMore = nextChunk();
-        if (!hasMore) {
-          stopTypingTimer();
-          return;
-        }
-      }
-
-      const ch = currentChunkRef.current.slice(0, 1);
-      currentChunkRef.current = currentChunkRef.current.slice(1);
-      target.append(document.createTextNode(ch));
-      maybeScrollBottom();
-    }, 8);
-  };
+  const toolEvents = useMemo(
+    () =>
+      events
+        .map((event, index) => toToolEvent(event, index))
+        .filter((event): event is ToolEventView => event != null),
+    [events],
+  );
+  const hasToolEvents = toolEvents.length > 0;
 
   useEffect(() => {
-    const body = bodyRef.current;
-    if (!body) return;
-
-    if (isStreaming) {
-      setOpen(true);
-      if (detailsRef.current) detailsRef.current.open = true;
-      return;
-    }
-
-    flushAllNow();
-    setOpen(false);
-    if (detailsRef.current) detailsRef.current.open = false;
+    if (!isStreaming) return;
+    const timer = window.setInterval(() => {
+      setNowTick(Date.now());
+    }, 450);
+    return () => {
+      window.clearInterval(timer);
+    };
   }, [isStreaming]);
 
   useEffect(() => {
-    const body = bodyRef.current;
-    if (!body) return;
-
-    if (appendedCountRef.current > events.length) {
-      appendedCountRef.current = events.length;
-    }
-
-    const startIndex = appendedCountRef.current;
-    if (startIndex >= events.length) return;
-
-    const incoming = events.slice(startIndex);
-    appendedCountRef.current = events.length;
-
-    for (let i = 0; i < incoming.length; i += 1) {
-      const event = incoming[i];
-      const absoluteIndex = startIndex + i;
-      queueRef.current.push(`${mapThoughtLine(event, absoluteIndex)}\n\n`);
-    }
-
-    if (isStreaming) {
-      pumpTyping();
+    if (isStreaming && hasEvents) {
+      setOpen(true);
       return;
     }
-    flushAllNow();
-  }, [events, isStreaming]);
+    if (!isStreaming) {
+      setOpen(false);
+    }
+  }, [hasEvents, isStreaming]);
 
-  useEffect(() => {
-    return () => {
-      stopTypingTimer();
-    };
-  }, []);
-
-  // Keep hooks unconditional; hide panel only after all hooks are declared.
-  if (!hasEvents) {
+  if (!hasToolEvents && !isStreaming) {
     return null;
   }
 
-  return (
-    <details
-      ref={detailsRef}
-      open={open}
-      onToggle={(event) => {
-        const el = event.currentTarget;
-        setOpen(el.open);
-      }}
-      className="mb-2"
-    >
-      <summary
-        aria-label="Toggle retrieval log"
-        className="flex cursor-pointer list-none items-center gap-2 py-1 text-xs font-semibold text-[#9dc1e8]"
-      >
-        <SpinnerOrCheck done={done} />
-        <span>{summaryText}</span>
-      </summary>
+  const title = hasToolEvents
+    ? toolEvents[toolEvents.length - 1].title
+    : done
+      ? "Retrieval Finished"
+      : "Generating Answer";
+  const subtitle = hasToolEvents
+    ? `${toolEvents.length} tool events · ${formatSeconds(elapsedMs)}`
+    : `Waiting for tool events · ${formatSeconds(elapsedMs)}`;
+  const summary = hasToolEvents
+    ? `Latest: ${toolEvents[toolEvents.length - 1].title}`
+    : done
+      ? "No tool events were returned by backend."
+      : "Waiting for backend tool events...";
 
-      <div
-        ref={bodyRef}
-        role="log"
-        aria-live="polite"
-        aria-label="Retrieval pipeline log"
-        onScroll={(event) => {
-          const el = event.currentTarget;
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-          userScrolledRef.current = !atBottom;
-        }}
-        className="max-h-[320px] overflow-y-auto pb-2 font-mono text-[12px] leading-6 text-[#c2cfde] whitespace-pre-wrap break-words"
-      />
-    </details>
+  const toggleOpen = () => {
+    if (!hasToolEvents) return;
+    setOpen((value) => !value);
+  };
+
+  const handleCardClick = (event: MouseEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("[data-retrieval-log-content='true']")) return;
+    toggleOpen();
+  };
+
+  const handleCardKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!hasToolEvents) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleOpen();
+    }
+  };
+
+  return (
+    <section
+      className={`retrieval-log-card mb-2 w-full ${hasToolEvents ? "is-toggleable" : ""} ${open ? "is-open" : ""}`}
+      onClick={handleCardClick}
+      onKeyDown={handleCardKeyDown}
+      role={hasToolEvents ? "button" : undefined}
+      tabIndex={hasToolEvents ? 0 : undefined}
+      aria-expanded={hasToolEvents ? open : undefined}
+      aria-label={hasToolEvents ? "Toggle tool log" : undefined}
+    >
+      <div className="retrieval-log-header">
+        <span className="retrieval-log-icon">
+          <SpinnerOrCheck done={done} />
+        </span>
+        <div className="min-w-0">
+          <p className="retrieval-log-title">{title}</p>
+          {subtitle ? (
+            <p className="retrieval-log-subtitle">{subtitle}</p>
+          ) : null}
+        </div>
+        {/* {hasToolEvents ? (
+          <button
+            type="button"
+            className="retrieval-log-toggle"
+            onClick={(event) => {
+              event.stopPropagation();
+              setOpen((value) => !value);
+            }}
+          >
+            {open ? "Hide log" : "Show log"}
+          </button>
+        ) : null} */}
+      </div>
+
+      {isStreaming ? (
+        <div className="retrieval-log-pulse" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+      ) : null}
+
+      <p className="retrieval-log-summary">{summary}</p>
+
+      {hasToolEvents && open ? (
+        <ol className="retrieval-log-list" data-retrieval-log-content="true">
+          {toolEvents.map((event, index) => (
+            <li key={event.key} className="retrieval-log-item">
+              <div className="retrieval-log-item-head">
+                <span className="retrieval-log-stage-index">[{index + 1}]</span>
+                <span className="retrieval-log-stage-name">{event.title}</span>
+              </div>
+              {event.at ? (
+                <p className="retrieval-log-meta">{event.at}</p>
+              ) : null}
+
+              <div className="retrieval-log-block">
+                <p className="retrieval-log-block-title">Parameters</p>
+                <pre className="retrieval-log-json">
+                  <code>{jsonBlock(event.parameters)}</code>
+                </pre>
+              </div>
+
+              <div className="retrieval-log-block">
+                <p className="retrieval-log-block-title">Result</p>
+                <pre className="retrieval-log-json">
+                  <code>{jsonBlock(event.result)}</code>
+                </pre>
+              </div>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </section>
   );
 }

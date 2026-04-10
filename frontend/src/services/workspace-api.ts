@@ -5,7 +5,6 @@ const RAG_COLLECTION = import.meta.env.VITE_RAG_COLLECTION ?? "documents";
 const RAG_DOC_LANGUAGE = import.meta.env.VITE_RAG_DOC_LANGUAGE ?? "mixed";
 
 const FOLDERS_KEY = "powerful-rag-ui-folders-v1";
-const CHATS_KEY = "powerful-rag-ui-chats-v1";
 
 export type WorkspaceFolder = {
   folder_id: string;
@@ -373,17 +372,6 @@ type ChatTitleApiResponse = {
   title: string;
 };
 
-type StoredChatThread = {
-  thread_id: string;
-  user_id: string;
-  title: string;
-  selected_doc_ids: string[];
-  created_at: string;
-  updated_at: string;
-  last_message_at: string;
-  messages: ChatMessageRecord[];
-};
-
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -441,29 +429,6 @@ function readFolders(): WorkspaceFolder[] {
 
 function writeFolders(rows: WorkspaceFolder[]): void {
   writeLocal(FOLDERS_KEY, rows);
-}
-
-function readChatThreads(): StoredChatThread[] {
-  return readLocal<StoredChatThread[]>(CHATS_KEY, []);
-}
-
-function writeChatThreads(rows: StoredChatThread[]): void {
-  writeLocal(CHATS_KEY, rows);
-}
-
-function summarizeThread(thread: StoredChatThread): ChatThreadSummary {
-  const last = thread.messages.length > 0 ? thread.messages[thread.messages.length - 1] : null;
-  return {
-    thread_id: thread.thread_id,
-    user_id: thread.user_id,
-    title: thread.title,
-    selected_doc_ids: thread.selected_doc_ids,
-    message_count: thread.messages.length,
-    last_message_preview: last?.content?.slice(0, 120) ?? "",
-    created_at: thread.created_at,
-    updated_at: thread.updated_at,
-    last_message_at: thread.last_message_at,
-  };
 }
 
 function normalizeDocumentStatus(status: string): string {
@@ -544,66 +509,35 @@ export async function listDocuments(): Promise<WorkspaceDocument[]> {
 }
 
 export async function listChatThreads(): Promise<ChatThreadSummary[]> {
-  const rows = readChatThreads();
-  return rows
-    .map(summarizeThread)
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  const payload = await request<{ items: ChatThreadSummary[] }>("/chat/threads");
+  return (payload.items ?? []).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 }
 
 export function createChatThread(payload?: CreateChatThreadPayload) {
-  const now = nowIso();
-  const rows = readChatThreads();
-  const created: StoredChatThread = {
-    thread_id: randomId("thread"),
-    user_id: "local-user",
-    title: (payload?.title || "New chat").trim() || "New chat",
-    selected_doc_ids: payload?.selected_doc_ids ?? [],
-    created_at: now,
-    updated_at: now,
-    last_message_at: now,
-    messages: [],
-  };
-  writeChatThreads([created, ...rows]);
-  return Promise.resolve(summarizeThread(created));
+  return request<ChatThreadSummary>("/chat/threads", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      title: payload?.title,
+      selected_doc_ids: payload?.selected_doc_ids ?? [],
+    }),
+  });
 }
 
 export function getChatThread(threadId: string) {
-  const rows = readChatThreads();
-  const thread = rows.find((row) => row.thread_id === threadId);
-  if (!thread) {
-    return Promise.reject(new Error(`Chat thread not found: ${threadId}`));
-  }
-  const detail: ChatThreadDetail = {
-    thread_id: thread.thread_id,
-    user_id: thread.user_id,
-    title: thread.title,
-    selected_doc_ids: thread.selected_doc_ids,
-    created_at: thread.created_at,
-    updated_at: thread.updated_at,
-    last_message_at: thread.last_message_at,
-    messages: thread.messages,
-  };
-  return Promise.resolve(detail);
+  return request<ChatThreadDetail>(`/chat/threads/${encodeURIComponent(threadId)}`);
 }
 
 export function updateChatThread(threadId: string, payload: UpdateChatThreadPayload) {
-  const rows = readChatThreads();
-  let updated: StoredChatThread | null = null;
-  const next = rows.map((row) => {
-    if (row.thread_id !== threadId) return row;
-    updated = {
-      ...row,
-      title: payload.title ?? row.title,
-      selected_doc_ids: payload.selected_doc_ids ?? row.selected_doc_ids,
-      updated_at: nowIso(),
-    };
-    return updated;
+  return request<ChatThreadSummary>(`/chat/threads/${encodeURIComponent(threadId)}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
   });
-  if (!updated) {
-    return Promise.reject(new Error(`Chat thread not found: ${threadId}`));
-  }
-  writeChatThreads(next);
-  return Promise.resolve(summarizeThread(updated));
 }
 
 export async function generateChatTitle(payload: {
@@ -627,9 +561,9 @@ export async function generateChatTitle(payload: {
 }
 
 export function deleteChatThread(threadId: string) {
-  const rows = readChatThreads();
-  writeChatThreads(rows.filter((row) => row.thread_id !== threadId));
-  return Promise.resolve();
+  return request<void>(`/chat/threads/${encodeURIComponent(threadId)}`, {
+    method: "DELETE",
+  });
 }
 
 export async function appendChatMessages(
@@ -640,55 +574,41 @@ export async function appendChatMessages(
   debugPayload?: ChatMessageRecord["debug"],
   answerMeta?: NonNullable<NonNullable<ChatMessageRecord["metadata"]>["answer_meta"]>,
 ) {
-  const docs = await fetchDocumentListFromBackend();
-  const docsById = new Map(docs.map((d) => [d.doc_id, d]));
-  const now = nowIso();
-  const rows = readChatThreads();
-  const threadIndex = rows.findIndex((row) => row.thread_id === threadId);
-  if (threadIndex < 0) {
-    throw new Error(`Chat thread not found: ${threadId}`);
-  }
-
-  const thread = rows[threadIndex];
-  const seqBase = thread.messages.length;
-  const userMessage: ChatMessageRecord = {
-    message_id: randomId("msg-user"),
-    thread_id: threadId,
-    role: "user",
-    content: userText,
-    seq: seqBase + 1,
-    created_at: now,
-    metadata: {
-      selected_docs: selectedDocIds.map((id) => ({
-        doc_id: id,
-        source_name: docsById.get(id)?.source_name || id,
-        pages: docsById.get(id)?.pages,
-      })),
+  return request<ChatMessageRecord>(
+    `/chat/threads/${encodeURIComponent(threadId)}/messages/append`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        user_text: userText,
+        assistant_text: assistantText,
+        selected_doc_ids: selectedDocIds,
+        debug: debugPayload ?? null,
+        answer_meta: answerMeta ?? null,
+      }),
     },
-  };
-  const assistantMessage: ChatMessageRecord = {
-    message_id: randomId("msg-assistant"),
-    thread_id: threadId,
-    role: "assistant",
-    content: assistantText,
-    seq: seqBase + 2,
-    created_at: now,
-    debug: debugPayload ?? null,
-    metadata: answerMeta ? { answer_meta: answerMeta } : null,
-  };
+  );
+}
 
-  const updatedThread: StoredChatThread = {
-    ...thread,
-    updated_at: now,
-    last_message_at: now,
-    selected_doc_ids: selectedDocIds,
-    messages: [...thread.messages, userMessage, assistantMessage],
-  };
-
-  const next = [...rows];
-  next[threadIndex] = updatedThread;
-  writeChatThreads(next);
-  return assistantMessage;
+export async function replaceChatTurnWithLatest(
+  threadId: string,
+  payload: {
+    target_user_message_id: string;
+    target_assistant_message_id?: string | null;
+  },
+) {
+  return request<ChatThreadDetail>(
+    `/chat/threads/${encodeURIComponent(threadId)}/turns/replace-latest`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export async function uploadDocument(file: File, folderId?: string | null) {
@@ -759,12 +679,14 @@ export function updateDocument(docId: string, payload: UpdateDocumentPayload) {
   });
 }
 
-export async function autofillDocumentDescription(docId: string) {
-  const docs = await fetchDocumentListFromBackend();
-  const doc = docs.find((item) => item.doc_id === docId);
-  if (!doc) throw new Error(`Document not found: ${docId}`);
-  const desc = doc.source_name.replace(/\.[a-zA-Z0-9]+$/, "");
-  return updateDocument(docId, { description: desc });
+export async function autofillDocumentDescription(docId: string, force = false) {
+  const query = force ? "?force=1" : "";
+  return request<WorkspaceDocument>(
+    `/documents/${encodeURIComponent(docId)}/description/autofill${query}`,
+    {
+      method: "POST",
+    },
+  );
 }
 
 export async function rebuildDocumentIndex(docIds?: string[]) {

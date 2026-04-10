@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
+from pathlib import Path
 from openai import OpenAI
 
 from dotenv import load_dotenv
@@ -41,10 +44,18 @@ def build_context(results: list[dict]) -> tuple[str, list[dict]]:
         heading = chunk.get("heading_path", "未知章节")
         content = chunk.get("content", "").strip()
         source_type = chunk.get("source", "")
+        chunk_type = str(chunk.get("chunk_type") or "text").strip().lower() or "text"
+        source_type_for_citation = chunk_type if chunk_type in {"image", "table"} else source_type
+        image_path = str(chunk.get("image_path") or "")
+        page = chunk.get("page")
 
         # 表格 chunk 的 content 是 JSON 字符串，加一个标注让 LLM 知道这是结构化数据
-        if source_type == "table":
+        if source_type == "table" or chunk_type == "table":
             label = f"【参考资料{idx}】（结构化表格数据）来源: {heading}"
+        elif chunk_type == "image":
+            page_label = f", page={page}" if page not in (None, "") else ""
+            path_label = f", image={image_path}" if image_path else ""
+            label = f"【参考资料{idx}】（图像理解）来源: {heading}{page_label}{path_label}"
         else:
             label = f"【参考资料{idx}】来源: {heading}"
 
@@ -54,7 +65,10 @@ def build_context(results: list[dict]) -> tuple[str, list[dict]]:
             "heading_path": heading,
             "doc_id":       chunk.get("doc_id", ""),
             "source_name":  chunk.get("source_name", chunk.get("doc_id", "")),
-            "source_type":  source_type,
+            "source_type":  source_type_for_citation,
+            "chunk_type":   chunk_type,
+            "image_path":   image_path,
+            "page":         page,
             "rerank_score": chunk.get("rerank_score", chunk.get("final_score", 0)),
         })
 
@@ -91,6 +105,105 @@ def build_prompt(question: str, context: str) -> tuple[str, str]:
     return system_prompt, user_prompt
 
 
+def _image_path_to_data_url(path: str) -> str | None:
+    p = Path(str(path or "")).expanduser().resolve()
+    if not p.exists() or not p.is_file():
+        return None
+    try:
+        data = p.read_bytes()
+    except Exception:
+        return None
+
+    mime = mimetypes.guess_type(p.name)[0] or "image/png"
+    max_side_px = int(os.environ.get("GENERATION_IMAGE_MAX_SIDE", "1024"))
+    if max_side_px > 0:
+        try:
+            from io import BytesIO
+            from PIL import Image
+
+            with Image.open(p) as image:
+                img = image.convert("RGB")
+                if max(img.size) > max_side_px:
+                    scale = max_side_px / float(max(img.size))
+                    resized = (
+                        max(1, int(img.width * scale)),
+                        max(1, int(img.height * scale)),
+                    )
+                    img = img.resize(resized)
+                buffer = BytesIO()
+                img.save(buffer, format="JPEG", quality=85, optimize=True)
+                data = buffer.getvalue()
+                mime = "image/jpeg"
+        except Exception:
+            pass
+
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _collect_image_inputs(results: list[dict]) -> list[dict]:
+    max_images = int(os.environ.get("GENERATION_MAX_IMAGE_INPUTS", "3"))
+    if max_images <= 0:
+        return []
+
+    seen: set[str] = set()
+    items: list[dict] = []
+    for row in results:
+        chunk_type = str(row.get("chunk_type") or "").strip().lower()
+        if chunk_type != "image":
+            continue
+        image_path = str(row.get("image_path") or "").strip()
+        if not image_path or image_path in seen:
+            continue
+        seen.add(image_path)
+        data_url = _image_path_to_data_url(image_path)
+        if not data_url:
+            continue
+        items.append(
+            {
+                "heading_path": str(row.get("heading_path") or ""),
+                "image_path": image_path,
+                "page": row.get("page"),
+                "data_url": data_url,
+            }
+        )
+        if len(items) >= max_images:
+            break
+    return items
+
+
+def _build_user_message_content(user_prompt: str, image_inputs: list[dict]):
+    if not image_inputs:
+        return user_prompt
+
+    content: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                f"{user_prompt}\n\n"
+                "你还会收到若干原图，请与参考资料共同使用；"
+                "若图像与文字描述冲突，以图像中可见信息为准。"
+            ),
+        }
+    ]
+    for idx, item in enumerate(image_inputs, start=1):
+        heading = item.get("heading_path", "")
+        page = item.get("page")
+        meta = f"来源: {heading}" if heading else "来源: image chunk"
+        if page not in (None, ""):
+            meta += f", page={page}"
+        content.append({"type": "text", "text": f"原图{idx}（{meta}）"})
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": item["data_url"],
+                    "detail": "low",
+                },
+            }
+        )
+    return content
+
+
 # ── Step 3：调用 LLM 生成答案 ─────────────────────────────────────────────────
 
 def generate(
@@ -121,10 +234,11 @@ def generate(
     context, sources = build_context(results)
     system_prompt, user_prompt = build_prompt(question, context)
 
+    image_inputs = _collect_image_inputs(results)
     if stream:
-        answer = _generate_stream(system_prompt, user_prompt)
+        answer = _generate_stream(system_prompt, user_prompt, image_inputs=image_inputs)
     else:
-        answer = _generate_sync(system_prompt, user_prompt)
+        answer = _generate_sync(system_prompt, user_prompt, image_inputs=image_inputs)
 
     return {
         "answer":   answer,
@@ -133,31 +247,37 @@ def generate(
     }
 
 
-def _generate_sync(system_prompt: str, user_prompt: str) -> str:
+def _generate_sync(system_prompt: str, user_prompt: str, image_inputs: list[dict] | None = None) -> str:
     """非流式调用，等待完整响应后返回。"""
     client, model = _get_llm_client_and_model()
+    user_content = _build_user_message_content(user_prompt, image_inputs or [])
     resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user",   "content": user_content},
         ],
         temperature=0.3,   # 事实类问答降低随机性，答案更稳定
     )
     return resp.choices[0].message.content.strip()
 
 
-def _generate_stream(system_prompt: str, user_prompt: str) -> str:
+def _generate_stream(
+    system_prompt: str,
+    user_prompt: str,
+    image_inputs: list[dict] | None = None,
+) -> str:
     """
     流式调用，边生成边打印到终端。
     返回完整的答案字符串（方便后续处理）。
     """
     client, model = _get_llm_client_and_model()
+    user_content = _build_user_message_content(user_prompt, image_inputs or [])
     stream = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
+            {"role": "user",   "content": user_content},
         ],
         temperature=0.3,
         stream=True,

@@ -114,6 +114,8 @@ export default function App() {
     toggleDocumentSelection,
     removeDocumentFromSelection,
     handleSend,
+    handleEditMessage,
+    handleRetryMessage,
     handleKeyDown,
     chatThreads,
     chatListLoading,
@@ -312,6 +314,7 @@ export default function App() {
           {activeNav === "new-chat" && (
             <ChatView
               chatStarted={chatStarted}
+              folders={folders}
               documents={documents}
               uploadingDocument={uploadingDocument}
               quickUploadDragOver={quickUploadDragOver}
@@ -329,6 +332,8 @@ export default function App() {
               onComposerKeyDown={handleKeyDown}
               onToggleWebSearch={() => setWebSearchEnabled((previous) => !previous)}
               onSend={handleSend}
+              onEditMessage={handleEditMessage}
+              onRetryMessage={handleRetryMessage}
             />
           )}
 

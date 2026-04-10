@@ -62,6 +62,11 @@ type AnswerApiResponse = {
   answer: string;
   sources?: Array<Record<string, unknown>>;
   retrieval_results?: Array<Record<string, unknown>>;
+  events?: Array<Record<string, unknown>>;
+  tool_events?: Array<Record<string, unknown>>;
+  debug?: {
+    events?: Array<Record<string, unknown>>;
+  };
 };
 
 const ANSWER_API_URL =
@@ -78,19 +83,6 @@ function normalizeThreadId(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function newDebugEvent(
-  stage: string,
-  detail: string,
-  data?: Record<string, unknown>,
-): AssistantDebugEvent {
-  return {
-    stage,
-    detail,
-    data,
-    at: Date.now(),
-  };
-}
-
 function compactText(value: unknown, max = 140): string {
   const raw = typeof value === "string" ? value : value == null ? "" : String(value);
   const compact = raw.replace(/\s+/g, " ").trim();
@@ -103,25 +95,66 @@ function toNumberOrNull(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function buildRecallPreview(
-  retrievalResults: Array<Record<string, unknown>> | undefined,
-): Record<string, unknown> {
-  const rows = Array.isArray(retrievalResults) ? retrievalResults : [];
-  const preview = rows.slice(0, 6).map((row, idx) => ({
-    rank: idx + 1,
-    doc_id: String(row.doc_id ?? ""),
-    source_name: String(row.source_name ?? row.doc_id ?? ""),
-    heading_path: String(row.heading_path ?? ""),
-    source: String(row.source ?? ""),
-    chunk_index: typeof row.chunk_index === "number" ? row.chunk_index : toNumberOrNull(row.chunk_index),
-    rerank_score: toNumberOrNull(row.rerank_score),
-    rrf_score: toNumberOrNull(row.rrf_score),
-    snippet: compactText(row.content),
-  }));
-  return {
-    total_hits: rows.length,
-    top_hits: preview,
+function normalizeBackendDebugEvents(
+  payload: AnswerApiResponse,
+): AssistantDebugEvent[] {
+  const candidates: Array<Record<string, unknown>> = [];
+  const collect = (rows: unknown) => {
+    if (!Array.isArray(rows)) return;
+    for (const row of rows) {
+      if (row && typeof row === "object") {
+        candidates.push(row as Record<string, unknown>);
+      }
+    }
   };
+
+  collect(payload.events);
+  collect(payload.tool_events);
+  collect(payload.debug?.events);
+
+  const normalized: AssistantDebugEvent[] = [];
+  for (const row of candidates) {
+    const stage = String(row.stage ?? row.type ?? "tool").trim();
+    const detail = String(
+      row.detail ??
+        row.name ??
+        row.tool_name ??
+        row.tool ??
+        stage,
+    ).trim();
+
+    const explicitData =
+      row.data && typeof row.data === "object"
+        ? (row.data as Record<string, unknown>)
+        : null;
+
+    const parameters =
+      row.parameters ??
+      row.params ??
+      row.arguments ??
+      row.args;
+    const result =
+      row.result ??
+      row.output ??
+      row.response;
+
+    let data: Record<string, unknown> | undefined = explicitData ?? undefined;
+    if (data == null && (parameters !== undefined || result !== undefined)) {
+      data = {
+        parameters: parameters ?? {},
+        result: result ?? {},
+      };
+    }
+
+    const atCandidate = Number(row.at);
+    normalized.push({
+      stage: stage || "tool",
+      detail: detail || stage || "tool",
+      data,
+      at: Number.isFinite(atCandidate) ? atCandidate : Date.now(),
+    });
+  }
+  return normalized;
 }
 
 function buildCitations(
@@ -143,7 +176,7 @@ function buildCitations(
       heading_path: String(src?.heading_path ?? hit?.heading_path ?? ""),
       doc_id: docId,
       source_name: sourceName,
-      source_type: String(src?.source_type ?? hit?.source ?? ""),
+      source_type: String(src?.source_type ?? hit?.chunk_type ?? hit?.source ?? ""),
       chunk_index:
         typeof hit?.chunk_index === "number" ? hit.chunk_index : toNumberOrNull(hit?.chunk_index) ?? -1,
       snippet: compactText(hit?.content, 200),
@@ -188,15 +221,15 @@ export const requestAssistantReply = async (
   }
 
   const data = (await response.json()) as AnswerApiResponse;
-  const recallPreview = buildRecallPreview(data.retrieval_results);
   const citations = buildCitations(data.sources, data.retrieval_results);
-
-  const retrievalEvent = newDebugEvent("retrieval", "Top recalled chunks", recallPreview);
-  collectedDebugEvents.push(retrievalEvent);
-  onStreamEvent?.({
-    type: "debug",
-    event: retrievalEvent,
-  });
+  const backendEvents = normalizeBackendDebugEvents(data);
+  for (const event of backendEvents) {
+    collectedDebugEvents.push(event);
+    onStreamEvent?.({
+      type: "debug",
+      event,
+    });
+  }
 
   const answerText = (data.answer || "").trim() || "No answer returned.";
   const threadId = normalizeThreadId(options?.threadId);

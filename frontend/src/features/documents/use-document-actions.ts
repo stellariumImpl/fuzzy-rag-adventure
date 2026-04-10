@@ -461,7 +461,7 @@ export function useDocumentActions({
       const target = documents.find((doc) => doc.id === docId);
       if (
         target &&
-        isPlaceholderDocumentDescription(target.description) &&
+        isPlaceholderDocumentDescription(target.description, target.name) &&
         autofillingDescriptionDocId !== docId
       ) {
         setAutofillingDescriptionDocId(docId);

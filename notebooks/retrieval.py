@@ -111,6 +111,7 @@ def _hits_to_docs(hits, source: str) -> list[dict]:
     docs: list[dict] = []
     for hit in hits:
         payload = hit.payload or {}
+        chunk_type = str(payload.get("chunk_type") or "text").strip().lower() or "text"
         docs.append(
             {
                 "point_id": str(hit.id),
@@ -120,6 +121,12 @@ def _hits_to_docs(hits, source: str) -> list[dict]:
                 "chunk_index": payload.get("chunk_index", -1),
                 "score": float(hit.score),
                 "source": source,
+                "chunk_type": chunk_type,
+                "image_path": payload.get("image_path", ""),
+                "image_rel_path": payload.get("image_rel_path", ""),
+                "image_category": payload.get("image_category", ""),
+                "image_sha256": payload.get("image_sha256", ""),
+                "page": payload.get("page"),
             }
         )
     return docs
@@ -505,6 +512,7 @@ def table_search(
             "chunk_index": -1,
             "score": hit_count / len(query_tokens),
             "source": "table",
+            "chunk_type": "table",
         }
         for hit_count, record_doc_id, record in scored[:top_k]
     ]

@@ -183,7 +183,7 @@ export function PreviewModal({
                 <p className="mt-2 text-sm leading-6 text-[#b6bfcc]">
                   {autofillingDescriptionDocId === previewDocument.id
                     ? "Generating description..."
-                    : getDocumentDescriptionLabel(previewDocumentDescription)}
+                    : getDocumentDescriptionLabel(previewDocumentDescription, previewDocument.name)}
                 </p>
               </div>
 

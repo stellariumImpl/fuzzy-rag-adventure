@@ -424,7 +424,7 @@ export function DocumentsView({
                   </button>
                 </div>
                 <p className="line-clamp-2 text-sm text-[#a8aebb]">
-                  {getDocumentDescriptionLabel(doc.description)}
+                  {getDocumentDescriptionLabel(doc.description, doc.name)}
                 </p>
                 <p className="mt-4 text-sm text-[#a8aebb]">
                   {doc.pages} pages • {formatUploadedLabel(doc.uploadedAt)}
@@ -596,7 +596,7 @@ export function DocumentsView({
                       </div>
                     </div>
                     <p className="ml-8 line-clamp-1 text-xs text-[#a5acb8] sm:ml-10 sm:text-sm">
-                      {getDocumentDescriptionLabel(doc.description)}
+                      {getDocumentDescriptionLabel(doc.description, doc.name)}
                     </p>
                   </div>
 

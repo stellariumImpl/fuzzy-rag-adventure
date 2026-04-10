@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import traceback
 import uuid
 import html
@@ -43,6 +44,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_STAGING_DIR = DATA_DIR / "upload_staging"
 UPLOAD_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 DOC_REGISTRY_PATH = DATA_DIR / "documents_registry.json"
+WORKSPACE_DB_PATH = DATA_DIR / "workspace.sqlite3"
 ALLOWED_DOC_LANGUAGES = {"en", "zh", "mixed", "auto"}
 DIRECT_INGEST_EXTENSIONS = {".md", ".txt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
@@ -515,6 +517,7 @@ class AnswerResponse(BaseModel):
     answer: str
     sources: list[dict]
     retrieval_results: list[dict]
+    tool_events: list[dict] = Field(default_factory=list)
 
 
 class ChatTitleRequest(BaseModel):
@@ -525,6 +528,29 @@ class ChatTitleRequest(BaseModel):
 
 class ChatTitleResponse(BaseModel):
     title: str
+
+
+class ChatThreadCreateRequest(BaseModel):
+    title: str | None = None
+    selected_doc_ids: list[str] | None = None
+
+
+class ChatThreadPatchRequest(BaseModel):
+    title: str | None = None
+    selected_doc_ids: list[str] | None = None
+
+
+class ChatThreadAppendMessagesRequest(BaseModel):
+    user_text: str
+    assistant_text: str
+    selected_doc_ids: list[str] = Field(default_factory=list)
+    debug: dict[str, Any] | None = None
+    answer_meta: dict[str, Any] | None = None
+
+
+class ChatThreadReplaceTurnRequest(BaseModel):
+    target_user_message_id: str
+    target_assistant_message_id: str | None = None
 
 
 class UploadResponse(BaseModel):
@@ -580,6 +606,7 @@ _TASKS: dict[str, dict[str, Any]] = {}
 _TASK_LOCK = Lock()
 _DOC_LOCK = Lock()
 _SETTINGS_LOCK = Lock()
+_CHAT_LOCK = Lock()
 
 _SERVICE_CACHE: dict[str, RAGService] = {}
 _SERVICE_LOCK = Lock()
@@ -747,6 +774,10 @@ def _save_ingest_artifacts(output_dir: Path, processed: dict[str, Any]) -> None:
         json.dumps(processed["text_chunks"], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    (output_dir / "image_chunks.json").write_text(
+        json.dumps(processed.get("image_chunks", []), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     (output_dir / "table_records.json").write_text(
         json.dumps(processed["table_records"], ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -886,6 +917,235 @@ def _to_workspace_document(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _chat_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(WORKSPACE_DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _init_chat_db() -> None:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    selected_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_message_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    message_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    debug_json TEXT,
+                    metadata_json TEXT,
+                    seq INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES chat_threads(thread_id) ON DELETE CASCADE,
+                    CHECK (role IN ('user', 'assistant'))
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_thread_seq
+                    ON chat_messages(thread_id, seq);
+                CREATE INDEX IF NOT EXISTS idx_chat_threads_updated_at
+                    ON chat_threads(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created_at
+                    ON chat_messages(thread_id, created_at ASC);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _chat_json_dumps(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _chat_json_loads(raw: str | None, fallback: Any) -> Any:
+    if raw is None or raw == "":
+        return fallback
+    try:
+        return json.loads(raw)
+    except Exception:
+        return fallback
+
+
+def _chat_decode_selected_doc_ids(raw: str | None) -> list[str]:
+    parsed = _chat_json_loads(raw, [])
+    if not isinstance(parsed, list):
+        return []
+    return _normalize_selected_doc_ids([str(item or "") for item in parsed])
+
+
+def _chat_message_row_to_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "message_id": str(row["message_id"]),
+        "thread_id": str(row["thread_id"]),
+        "role": str(row["role"]),
+        "content": str(row["content"]),
+        "debug": _chat_json_loads(row["debug_json"], None),
+        "metadata": _chat_json_loads(row["metadata_json"], None),
+        "seq": int(row["seq"]),
+        "created_at": str(row["created_at"]),
+    }
+
+
+def _chat_summary_query_sql() -> str:
+    return """
+        SELECT
+            t.thread_id,
+            t.user_id,
+            t.title,
+            t.selected_doc_ids_json,
+            t.created_at,
+            t.updated_at,
+            t.last_message_at,
+            (
+                SELECT COUNT(1)
+                FROM chat_messages m
+                WHERE m.thread_id = t.thread_id
+            ) AS message_count,
+            COALESCE(
+                (
+                    SELECT m.content
+                    FROM chat_messages m
+                    WHERE m.thread_id = t.thread_id
+                    ORDER BY m.seq DESC
+                    LIMIT 1
+                ),
+                ''
+            ) AS last_message_preview
+        FROM chat_threads t
+    """
+
+
+def _chat_summary_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "thread_id": str(row["thread_id"]),
+        "user_id": str(row["user_id"]),
+        "title": str(row["title"]),
+        "selected_doc_ids": _chat_decode_selected_doc_ids(row["selected_doc_ids_json"]),
+        "message_count": int(row["message_count"] or 0),
+        "last_message_preview": str(row["last_message_preview"] or ""),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "last_message_at": str(row["last_message_at"]),
+    }
+
+
+def _chat_fetch_thread_row(conn: sqlite3.Connection, thread_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT
+            thread_id,
+            user_id,
+            title,
+            selected_doc_ids_json,
+            created_at,
+            updated_at,
+            last_message_at
+        FROM chat_threads
+        WHERE thread_id = ?
+        """,
+        (thread_id,),
+    ).fetchone()
+
+
+def _chat_fetch_thread_summary(conn: sqlite3.Connection, thread_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        _chat_summary_query_sql() + " WHERE t.thread_id = ? LIMIT 1",
+        (thread_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _chat_summary_row_to_dict(row)
+
+
+def _chat_fetch_thread_detail(conn: sqlite3.Connection, thread_id: str) -> dict[str, Any] | None:
+    thread_row = _chat_fetch_thread_row(conn, thread_id)
+    if thread_row is None:
+        return None
+    message_rows = conn.execute(
+        """
+        SELECT
+            message_id,
+            thread_id,
+            role,
+            content,
+            debug_json,
+            metadata_json,
+            seq,
+            created_at
+        FROM chat_messages
+        WHERE thread_id = ?
+        ORDER BY seq ASC
+        """,
+        (thread_id,),
+    ).fetchall()
+    return {
+        "thread_id": str(thread_row["thread_id"]),
+        "user_id": str(thread_row["user_id"]),
+        "title": str(thread_row["title"]),
+        "selected_doc_ids": _chat_decode_selected_doc_ids(thread_row["selected_doc_ids_json"]),
+        "created_at": str(thread_row["created_at"]),
+        "updated_at": str(thread_row["updated_at"]),
+        "last_message_at": str(thread_row["last_message_at"]),
+        "messages": [_chat_message_row_to_record(row) for row in message_rows],
+    }
+
+
+def _chat_build_selected_docs_metadata(selected_doc_ids: list[str]) -> list[dict[str, Any]]:
+    docs_by_id: dict[str, dict[str, Any]] = {}
+    for row in _list_document_records():
+        doc_id = str(row.get("doc_id") or "").strip()
+        if doc_id:
+            docs_by_id[doc_id] = row
+
+    rows: list[dict[str, Any]] = []
+    for doc_id in selected_doc_ids:
+        item = docs_by_id.get(doc_id) or {}
+        pages_raw = item.get("pages")
+        pages: int | None = None
+        if pages_raw is not None:
+            try:
+                pages = int(pages_raw)
+            except Exception:
+                pages = None
+        payload: dict[str, Any] = {
+            "doc_id": doc_id,
+            "source_name": str(item.get("source_name") or doc_id),
+        }
+        if pages is not None:
+            payload["pages"] = pages
+        rows.append(payload)
+    return rows
+
+
+def _chat_selected_doc_ids_from_metadata(metadata: dict[str, Any] | None) -> list[str]:
+    if not isinstance(metadata, dict):
+        return []
+    raw_docs = metadata.get("selected_docs")
+    if not isinstance(raw_docs, list):
+        return []
+    ids: list[str] = []
+    for row in raw_docs:
+        if not isinstance(row, dict):
+            continue
+        ids.append(str(row.get("doc_id") or ""))
+    return _normalize_selected_doc_ids(ids)
+
+
 def _doc_page_sort_key(path: Path) -> tuple[int, str]:
     m = re.search(r"(\d+)$", path.stem)
     if m:
@@ -1015,9 +1275,13 @@ def _build_pipeline_details(
     if parsed_dir is not None and not parsed_dir.exists():
         parsed_dir = None
 
+    text_chunks: list[dict[str, Any]] = []
+    image_chunks: list[dict[str, Any]] = []
     chunks: list[dict[str, Any]] = []
     if parsed_dir is not None:
-        chunks = _read_json_list(parsed_dir / "text_chunks.json")
+        text_chunks = _read_json_list(parsed_dir / "text_chunks.json")
+        image_chunks = _read_json_list(parsed_dir / "image_chunks.json")
+        chunks = text_chunks + image_chunks
 
     markdown_files: list[dict[str, Any]] = []
     markdown_texts: list[str] = []
@@ -1095,6 +1359,14 @@ def _build_pipeline_details(
     for idx, c in enumerate(chunks[start:end], start=start):
         content = str(c.get("content") or "")
         heading = str(c.get("heading_path") or "")
+        chunk_type = str(c.get("type") or "text").strip().lower() or "text"
+        page_value = c.get("page")
+        try:
+            page_no = int(page_value)
+            if page_no <= 0:
+                page_no = None
+        except (TypeError, ValueError):
+            page_no = None
         try:
             chunk_index = int(c.get("chunk_index"))
         except (TypeError, ValueError):
@@ -1105,14 +1377,17 @@ def _build_pipeline_details(
                 "chunk_id": f"{doc_id}-{chunk_index}",
                 "chunk_order": idx + 1,
                 "chunk_index": chunk_index,
-                "chunk_level": heading or "chunk",
+                "chunk_level": heading or chunk_type,
                 "heading_path": heading,
+                "chunk_type": chunk_type,
                 "char_count": len(content),
-                "page_start": None,
-                "page_end": None,
+                "page_start": page_no,
+                "page_end": page_no,
                 "preview": content[:240],
                 "text": content,
                 "has_table": bool(c.get("has_table", False)),
+                "image_path": str(c.get("image_path") or ""),
+                "image_category": str(c.get("image_category") or ""),
                 "embedding_index": {
                     "provider": "qdrant",
                     "collection_name": collection_name,
@@ -1130,7 +1405,7 @@ def _build_pipeline_details(
     embedded_chunks = (
         int(qdrant_snapshot["point_count"])
         if qdrant_snapshot["point_count"] > 0
-        else (int(row.get("text_chunks") or 0) if status == "ready" else 0)
+        else (int(row.get("text_chunks") or 0) + int(row.get("image_chunks") or 0) if status == "ready" else 0)
     )
     missing_chunks = max(0, total - embedded_chunks)
 
@@ -1140,7 +1415,7 @@ def _build_pipeline_details(
         "parse": {
             "provider": str(row.get("parse_provider") or "upload"),
             "summary": str(row.get("parse_summary") or "Uploaded document"),
-            "text_chars": int(sum(len(str(c.get("content") or "")) for c in chunks)),
+            "text_chars": int(sum(len(str(c.get("content") or "")) for c in text_chunks)),
             "image_count": image_count,
             "table_count": table_count,
             "garbled_risk": 0.0,
@@ -1153,6 +1428,7 @@ def _build_pipeline_details(
                 "parsed_output_dir": str(parsed_output_dir or ""),
                 "collection_name": collection_name,
                 "text_chunks_path": str(parsed_dir / "text_chunks.json") if parsed_dir is not None else "",
+                "image_chunks_path": str(parsed_dir / "image_chunks.json") if parsed_dir is not None else "",
                 "table_records_path": str(table_records_path) if table_records_path is not None else "",
                 "heading_corrections_path": (
                     str(parsed_dir / "heading_corrections.json") if parsed_dir is not None else ""
@@ -1525,6 +1801,144 @@ def _read_uploaded_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+def _normalize_inline_text(value: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1F\x7F]", " ", str(value or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _source_name_stem(source_name: str) -> str:
+    return Path(str(source_name or "").strip()).stem.strip()
+
+
+def _is_placeholder_document_description(value: str, source_name: str) -> bool:
+    normalized = _normalize_inline_text(value).lower()
+    if not normalized or normalized == "uploaded document":
+        return True
+    stem = _normalize_inline_text(_source_name_stem(source_name)).lower()
+    return bool(stem) and normalized == stem
+
+
+def _strip_markdown_for_description(text: str) -> str:
+    value = html.unescape(str(text or ""))
+    value = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", value)
+    value = re.sub(r"<img\s+[^>]*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"</?(table|thead|tbody|tr|th|td|p|div|span|section|article|br)[^>]*>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"`{1,3}[^`]*`{1,3}", " ", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
+    value = re.sub(r"[#>*_~|]", " ", value)
+    return _normalize_inline_text(value)
+
+
+def _extract_heading_for_description(markdown_text: str) -> str:
+    for raw_line in str(markdown_text or "").splitlines():
+        match = re.match(r"^\s*#{1,6}\s+(.+)$", raw_line)
+        if not match:
+            continue
+        heading = _strip_markdown_for_description(match.group(1))
+        if heading:
+            return heading
+    return ""
+
+
+def _extract_body_for_description(markdown_text: str) -> str:
+    for raw_line in str(markdown_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^#{1,6}\s+", line):
+            continue
+        if line.startswith("![") or line.lower().startswith("<img"):
+            continue
+        cleaned = _strip_markdown_for_description(line)
+        if len(cleaned) >= 4:
+            return cleaned
+    return _strip_markdown_for_description(markdown_text)
+
+
+def _build_auto_document_description(
+    source_name: str,
+    markdown_text: str,
+    table_count: int,
+    page_count: int,
+) -> str:
+    stem = _normalize_inline_text(_source_name_stem(source_name)).lower()
+    heading = _extract_heading_for_description(markdown_text)
+    body = _extract_body_for_description(markdown_text)
+
+    parts: list[str] = []
+    if heading and _normalize_inline_text(heading).lower() != stem:
+        parts.append(_normalize_inline_text(heading))
+
+    body_norm = _normalize_inline_text(body)
+    if body_norm and _normalize_inline_text(body_norm).lower() != stem:
+        if not parts:
+            parts.append(body_norm)
+        elif not body_norm.startswith(parts[0]):
+            parts.append(body_norm)
+
+    if not parts:
+        if table_count > 0:
+            return f"包含 {table_count} 条表格结构化记录。"
+        if page_count > 0:
+            return f"共 {page_count} 页文档。"
+        return ""
+
+    text = "。".join(parts[:2]).strip("。 ")
+    if not text:
+        return ""
+
+    max_chars = 140
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+
+
+def _load_markdown_for_description(parsed_dir: Path | None) -> str:
+    if parsed_dir is None or not parsed_dir.exists():
+        return ""
+
+    fixed_text_path = parsed_dir / "fixed_text.md"
+    if fixed_text_path.exists():
+        return _read_uploaded_text(fixed_text_path)
+
+    page_paths = sorted(parsed_dir.glob("doc_*.md"), key=_doc_page_sort_key)
+    if not page_paths:
+        return ""
+    parts = [_read_uploaded_text(path) for path in page_paths]
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _autofill_document_description_record(row: dict[str, Any], force: bool = False) -> dict[str, Any]:
+    doc_id = str(row.get("doc_id") or "")
+    if not doc_id:
+        return row
+
+    source_name = str(row.get("source_name") or doc_id)
+    current_description = str(row.get("description") or "")
+    if not force and not _is_placeholder_document_description(current_description, source_name):
+        return row
+
+    parsed_output_dir = row.get("parsed_output_dir")
+    parsed_dir = Path(str(parsed_output_dir)) if parsed_output_dir else None
+    if parsed_dir is not None and not parsed_dir.exists():
+        parsed_dir = None
+
+    markdown_text = _load_markdown_for_description(parsed_dir)
+    table_count = int(row.get("table_records") or 0)
+    page_count = int(row.get("pages") or 0)
+    generated = _build_auto_document_description(
+        source_name=source_name,
+        markdown_text=markdown_text,
+        table_count=table_count,
+        page_count=page_count,
+    )
+    if not generated:
+        return row
+    if generated == _normalize_inline_text(current_description):
+        return row
+    return _patch_document_record(doc_id, {"description": generated})
+
+
 def _materialize_uploaded_markdown(uploaded_path: Path) -> Path:
     suffix = uploaded_path.suffix.lower()
     if suffix not in DIRECT_INGEST_EXTENSIONS:
@@ -1616,7 +2030,13 @@ def _materialize_uploaded_pdf(uploaded_path: Path) -> tuple[Path, int, int]:
     return output_dir, len(pages), empty_pages
 
 
-def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, int, int]:
+def _materialize_uploaded_pdf_via_job_api(
+    uploaded_path: Path,
+    *,
+    job_url: str | None = None,
+    token: str | None = None,
+    model: str | None = None,
+) -> tuple[Path, int, int]:
     """
     按 notebooks/01_paddle_ocr_smoke_test.ipynb 的逻辑走远端解析服务：
     1) 提交本地 PDF 到 JOB_URL
@@ -1627,14 +2047,20 @@ def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, in
     import requests
     import time
 
-    job_url = (os.environ.get("JOB_URL") or "").strip()
-    token = (os.environ.get("TOKEN") or "").strip()
-    model = (os.environ.get("MODEL") or "").strip()
-    if not all([job_url, token, model]):
+    resolved_job_url = (
+        (os.environ.get("JOB_URL") or "").strip() if job_url is None else str(job_url).strip()
+    )
+    resolved_token = (
+        (os.environ.get("TOKEN") or "").strip() if token is None else str(token).strip()
+    )
+    resolved_model = (
+        (os.environ.get("MODEL") or "").strip() if model is None else str(model).strip()
+    )
+    if not all([resolved_job_url, resolved_token, resolved_model]):
         raise RuntimeError("Missing JOB_URL/TOKEN/MODEL for notebook parser.")
 
     headers = {
-        "Authorization": f"bearer {token}",
+        "Authorization": f"bearer {resolved_token}",
     }
     optional_payload = {
         "useDocOrientationClassify": False,
@@ -1643,12 +2069,12 @@ def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, in
     }
 
     data = {
-        "model": model,
+        "model": resolved_model,
         "optionalPayload": json.dumps(optional_payload, ensure_ascii=False),
     }
     with uploaded_path.open("rb") as f:
         files = {"file": f}
-        resp = requests.post(job_url, headers=headers, data=data, files=files, timeout=120)
+        resp = requests.post(resolved_job_url, headers=headers, data=data, files=files, timeout=120)
     if resp.status_code != 200:
         raise RuntimeError(f"submit failed: {resp.status_code} {resp.text[:400]}")
 
@@ -1662,7 +2088,7 @@ def _materialize_uploaded_pdf_via_job_api(uploaded_path: Path) -> tuple[Path, in
     started = time.time()
     jsonl_url = ""
     while True:
-        poll = requests.get(f"{job_url}/{job_id}", headers=headers, timeout=30)
+        poll = requests.get(f"{resolved_job_url}/{job_id}", headers=headers, timeout=30)
         if poll.status_code != 200:
             raise RuntimeError(f"poll failed: {poll.status_code} {poll.text[:400]}")
         job_data = poll.json().get("data", {})
@@ -1765,16 +2191,25 @@ def _run_ingest_task(task_id: str, req: IngestRequest) -> None:
         )
         model = os.environ.get("LLM_MODEL", "gpt-4o")
 
-        processed = process_markdown_text(raw_text, client=client, model=model)
+        processed = process_markdown_text(
+            raw_text,
+            client=client,
+            model=model,
+            pages=pages,
+            output_dir=output_dir,
+        )
         text_chunks: list[dict] = processed["text_chunks"]
+        image_chunks: list[dict] = processed.get("image_chunks", [])
+        image_stats: dict[str, Any] = processed.get("image_stats", {})
         table_records: list[dict] = processed["table_records"]
+        indexed_chunks = text_chunks + image_chunks
 
         _update_task(task_id, progress=65, message="embedding and upsert")
 
         doc_id = req.doc_id or output_dir.name
         embedder = get_embedder(doc_language=req.doc_language)
         upsert_chunks(
-            chunks=text_chunks,
+            chunks=indexed_chunks,
             embedder=embedder,
             collection_name=req.collection_name,
             doc_id=doc_id,
@@ -1799,13 +2234,30 @@ def _run_ingest_task(task_id: str, req: IngestRequest) -> None:
             "doc_id": doc_id,
             "pages": len(pages),
             "text_chunks": len(text_chunks),
+            "image_chunks": len(image_chunks),
+            "indexed_chunks": len(indexed_chunks),
+            "image_stats": image_stats,
             "table_records": len(table_records),
             "table_records_store_path": str(table_path) if req.persist_table_records else None,
             "table_records_store_count": table_total,
         }
 
         existing_row = _find_document_record(doc_id)
-        parse_provider = str(existing_row.get("parse_provider")) if existing_row is not None else "upload"
+        parse_provider = str(existing_row.get("parse_provider") or "upload") if existing_row is not None else "upload"
+        source_name = str(existing_row.get("source_name") or doc_id) if existing_row is not None else str(doc_id)
+        existing_description = str(existing_row.get("description") or "") if existing_row is not None else ""
+        auto_description = _build_auto_document_description(
+            source_name=source_name,
+            markdown_text=str(processed.get("fixed_text") or raw_text),
+            table_count=len(table_records),
+            page_count=len(pages),
+        )
+        if existing_row is None:
+            next_description = auto_description
+        elif _is_placeholder_document_description(existing_description, source_name):
+            next_description = auto_description or existing_description
+        else:
+            next_description = existing_description
         _upsert_document_registry(
             {
                 "doc_id": doc_id,
@@ -1814,10 +2266,12 @@ def _run_ingest_task(task_id: str, req: IngestRequest) -> None:
                 "status": "ready",
                 "parsed_output_dir": str(output_dir),
                 "text_chunks": len(text_chunks),
+                "image_chunks": len(image_chunks),
                 "table_records": len(table_records),
                 "vector_dimension": int(embedder.dimension),
                 "parse_summary": "Indexed successfully",
                 "parse_provider": parse_provider,
+                "description": next_description,
                 "task_id": task_id,
                 "task_status": "completed",
             }
@@ -1855,6 +2309,11 @@ def _run_ingest_task(task_id: str, req: IngestRequest) -> None:
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+
+@app.on_event("startup")
+def init_workspace_datastores() -> None:
+    _init_chat_db()
 
 
 @app.middleware("http")
@@ -2130,17 +2589,24 @@ async def upload(
     if suffix == ".pdf":
         parser_mode = "opendataloader"
         remote_parse_warning: str | None = None
+        state = _load_workspace_settings_state()
+        llama_settings = state.get("llamaparse", {}) if isinstance(state, dict) else {}
+        remote_parse_enabled = bool(llama_settings.get("enabled", False))
+        remote_job_url = str(llama_settings.get("base_url") or "").strip()
+        remote_token = str(llama_settings.get("api_key") or "").strip()
+        remote_model = str(llama_settings.get("model") or "").strip()
         try:
-            remote_parse_ready = all(
-                [
-                    (os.environ.get("JOB_URL") or "").strip(),
-                    (os.environ.get("TOKEN") or "").strip(),
-                    (os.environ.get("MODEL") or "").strip(),
-                ]
+            remote_parse_ready = remote_parse_enabled and all(
+                [remote_job_url, remote_token, remote_model]
             )
             if remote_parse_ready:
                 try:
-                    ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf_via_job_api(stored_path)
+                    ingest_output_dir, page_count, empty_pages = _materialize_uploaded_pdf_via_job_api(
+                        stored_path,
+                        job_url=remote_job_url,
+                        token=remote_token,
+                        model=remote_model,
+                    )
                     parser_mode = "notebook_job_api"
                 except Exception as remote_exc:
                     remote_parse_warning = f"{type(remote_exc).__name__}: {remote_exc}".replace("\n", " ")
@@ -2344,6 +2810,15 @@ def patch_document(doc_id: str, req: DocumentPatchRequest) -> dict[str, Any]:
     return _to_workspace_document(row)
 
 
+@app.post("/documents/{doc_id}/description/autofill")
+def autofill_document_description(doc_id: str, force: bool = False) -> dict[str, Any]:
+    row = _find_document_record(doc_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+    updated = _autofill_document_description_record(row, force=force)
+    return _to_workspace_document(updated)
+
+
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: str) -> dict[str, Any]:
     deleted = _delete_document_record(doc_id)
@@ -2452,6 +2927,419 @@ def generate_chat_title(req: ChatTitleRequest) -> ChatTitleResponse:
     return ChatTitleResponse(title=title)
 
 
+@app.get("/chat/threads")
+def list_chat_threads(user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            rows = conn.execute(
+                _chat_summary_query_sql()
+                + """
+                WHERE t.user_id = ?
+                ORDER BY t.updated_at DESC, t.created_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+            items = [_chat_summary_row_to_dict(row) for row in rows]
+            return {"items": items}
+        finally:
+            conn.close()
+
+
+@app.post("/chat/threads")
+def create_chat_thread(req: ChatThreadCreateRequest) -> dict[str, Any]:
+    thread_id = f"thread-{uuid.uuid4().hex}"
+    now = _now_iso()
+    selected_doc_ids = _normalize_selected_doc_ids(req.selected_doc_ids)
+    raw_title = _sanitize_chat_title(req.title or "")
+    title = raw_title or "New chat"
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO chat_threads (
+                    thread_id,
+                    user_id,
+                    title,
+                    selected_doc_ids_json,
+                    created_at,
+                    updated_at,
+                    last_message_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    DEFAULT_USER_ID,
+                    title,
+                    _chat_json_dumps(selected_doc_ids) or "[]",
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            summary = _chat_fetch_thread_summary(conn, thread_id)
+            if summary is None:
+                raise HTTPException(status_code=500, detail="Failed to create chat thread")
+            return summary
+        finally:
+            conn.close()
+
+
+@app.get("/chat/threads/{thread_id}")
+def get_chat_thread(thread_id: str) -> dict[str, Any]:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            detail = _chat_fetch_thread_detail(conn, thread_id)
+            if detail is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+            return detail
+        finally:
+            conn.close()
+
+
+@app.patch("/chat/threads/{thread_id}")
+def patch_chat_thread(thread_id: str, req: ChatThreadPatchRequest) -> dict[str, Any]:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            row = _chat_fetch_thread_row(conn, thread_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+
+            fields_set = set(req.model_fields_set)
+            current_title = str(row["title"])
+            current_doc_ids = _chat_decode_selected_doc_ids(row["selected_doc_ids_json"])
+
+            next_title = current_title
+            if "title" in fields_set:
+                next_title = _sanitize_chat_title(req.title or "") or "New chat"
+
+            next_doc_ids = current_doc_ids
+            if "selected_doc_ids" in fields_set:
+                next_doc_ids = _normalize_selected_doc_ids(req.selected_doc_ids)
+
+            if "title" in fields_set or "selected_doc_ids" in fields_set:
+                conn.execute(
+                    """
+                    UPDATE chat_threads
+                    SET
+                        title = ?,
+                        selected_doc_ids_json = ?,
+                        updated_at = ?
+                    WHERE thread_id = ?
+                    """,
+                    (
+                        next_title,
+                        _chat_json_dumps(next_doc_ids) or "[]",
+                        _now_iso(),
+                        thread_id,
+                    ),
+                )
+                conn.commit()
+
+            summary = _chat_fetch_thread_summary(conn, thread_id)
+            if summary is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+            return summary
+        finally:
+            conn.close()
+
+
+@app.delete("/chat/threads/{thread_id}")
+def delete_chat_thread(thread_id: str) -> dict[str, Any]:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            cur = conn.execute(
+                "DELETE FROM chat_threads WHERE thread_id = ?",
+                (thread_id,),
+            )
+            if cur.rowcount <= 0:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+            conn.commit()
+            return {"deleted": True, "thread_id": thread_id}
+        finally:
+            conn.close()
+
+
+@app.post("/chat/threads/{thread_id}/messages/append")
+def append_chat_messages(thread_id: str, req: ChatThreadAppendMessagesRequest) -> dict[str, Any]:
+    user_text = str(req.user_text or "").strip()
+    assistant_text = str(req.assistant_text or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="user_text is required")
+    if not assistant_text:
+        raise HTTPException(status_code=400, detail="assistant_text is required")
+
+    selected_doc_ids = _normalize_selected_doc_ids(req.selected_doc_ids)
+    now = _now_iso()
+    user_message_id = f"msg-user-{uuid.uuid4().hex}"
+    assistant_message_id = f"msg-assistant-{uuid.uuid4().hex}"
+
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            thread_row = _chat_fetch_thread_row(conn, thread_id)
+            if thread_row is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+
+            max_seq_row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM chat_messages WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            seq_base = int((max_seq_row["max_seq"] if max_seq_row is not None else 0) or 0)
+
+            user_metadata: dict[str, Any] = {
+                "selected_docs": _chat_build_selected_docs_metadata(selected_doc_ids)
+            }
+            assistant_metadata: dict[str, Any] | None = None
+            if isinstance(req.answer_meta, dict):
+                assistant_metadata = {"answer_meta": req.answer_meta}
+
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    message_id,
+                    thread_id,
+                    role,
+                    content,
+                    debug_json,
+                    metadata_json,
+                    seq,
+                    created_at
+                )
+                VALUES (?, ?, 'user', ?, NULL, ?, ?, ?)
+                """,
+                (
+                    user_message_id,
+                    thread_id,
+                    user_text,
+                    _chat_json_dumps(user_metadata),
+                    seq_base + 1,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    message_id,
+                    thread_id,
+                    role,
+                    content,
+                    debug_json,
+                    metadata_json,
+                    seq,
+                    created_at
+                )
+                VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?)
+                """,
+                (
+                    assistant_message_id,
+                    thread_id,
+                    assistant_text,
+                    _chat_json_dumps(req.debug),
+                    _chat_json_dumps(assistant_metadata),
+                    seq_base + 2,
+                    now,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE chat_threads
+                SET
+                    selected_doc_ids_json = ?,
+                    updated_at = ?,
+                    last_message_at = ?
+                WHERE thread_id = ?
+                """,
+                (
+                    _chat_json_dumps(selected_doc_ids) or "[]",
+                    now,
+                    now,
+                    thread_id,
+                ),
+            )
+            conn.commit()
+
+            row = conn.execute(
+                """
+                SELECT
+                    message_id,
+                    thread_id,
+                    role,
+                    content,
+                    debug_json,
+                    metadata_json,
+                    seq,
+                    created_at
+                FROM chat_messages
+                WHERE message_id = ?
+                LIMIT 1
+                """,
+                (assistant_message_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=500, detail="Failed to append chat messages")
+            return _chat_message_row_to_record(row)
+        finally:
+            conn.close()
+
+
+@app.post("/chat/threads/{thread_id}/turns/replace-latest")
+def replace_chat_turn_with_latest(
+    thread_id: str,
+    req: ChatThreadReplaceTurnRequest,
+) -> dict[str, Any]:
+    with _CHAT_LOCK:
+        conn = _chat_db_connect()
+        try:
+            thread_row = _chat_fetch_thread_row(conn, thread_id)
+            if thread_row is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+
+            message_rows = conn.execute(
+                """
+                SELECT
+                    message_id,
+                    thread_id,
+                    role,
+                    content,
+                    debug_json,
+                    metadata_json,
+                    seq,
+                    created_at
+                FROM chat_messages
+                WHERE thread_id = ?
+                ORDER BY seq ASC
+                """,
+                (thread_id,),
+            ).fetchall()
+            messages = [_chat_message_row_to_record(row) for row in message_rows]
+            if len(messages) < 2:
+                raise HTTPException(status_code=400, detail="Not enough messages to replace turn.")
+
+            latest_user = messages[-2]
+            latest_assistant = messages[-1]
+            if latest_user["role"] != "user" or latest_assistant["role"] != "assistant":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Latest messages are not a user+assistant pair.",
+                )
+
+            base = messages[:-2]
+            old_user_index = -1
+            for index, item in enumerate(base):
+                if item["role"] == "user" and item["message_id"] == req.target_user_message_id:
+                    old_user_index = index
+                    break
+            if old_user_index < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Target user message not found: {req.target_user_message_id}",
+                )
+
+            delete_count = 1
+            adjacent = base[old_user_index + 1] if old_user_index + 1 < len(base) else None
+            if (
+                adjacent is not None
+                and adjacent["role"] == "assistant"
+                and (
+                    req.target_assistant_message_id is None
+                    or adjacent["message_id"] == req.target_assistant_message_id
+                )
+            ):
+                delete_count = 2
+            elif req.target_assistant_message_id:
+                explicit_assistant_index = next(
+                    (
+                        idx
+                        for idx, item in enumerate(base)
+                        if item["role"] == "assistant"
+                        and item["message_id"] == req.target_assistant_message_id
+                    ),
+                    -1,
+                )
+                if explicit_assistant_index == old_user_index + 1:
+                    delete_count = 2
+
+            next_messages = list(base)
+            next_messages[old_user_index : old_user_index + delete_count] = [
+                latest_user,
+                latest_assistant,
+            ]
+
+            resequenced: list[dict[str, Any]] = []
+            for index, item in enumerate(next_messages, start=1):
+                next_item = dict(item)
+                next_item["seq"] = index
+                resequenced.append(next_item)
+
+            latest_selected_doc_ids = _chat_selected_doc_ids_from_metadata(
+                latest_user.get("metadata")
+            )
+            current_doc_ids = _chat_decode_selected_doc_ids(thread_row["selected_doc_ids_json"])
+            next_doc_ids = latest_selected_doc_ids if latest_selected_doc_ids else current_doc_ids
+            now = _now_iso()
+
+            conn.execute("DELETE FROM chat_messages WHERE thread_id = ?", (thread_id,))
+            for item in resequenced:
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (
+                        message_id,
+                        thread_id,
+                        role,
+                        content,
+                        debug_json,
+                        metadata_json,
+                        seq,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(item["message_id"]),
+                        thread_id,
+                        str(item["role"]),
+                        str(item["content"]),
+                        _chat_json_dumps(item.get("debug")),
+                        _chat_json_dumps(item.get("metadata")),
+                        int(item["seq"]),
+                        str(item.get("created_at") or now),
+                    ),
+                )
+
+            conn.execute(
+                """
+                UPDATE chat_threads
+                SET
+                    selected_doc_ids_json = ?,
+                    updated_at = ?,
+                    last_message_at = ?
+                WHERE thread_id = ?
+                """,
+                (
+                    _chat_json_dumps(next_doc_ids) or "[]",
+                    now,
+                    now,
+                    thread_id,
+                ),
+            )
+            conn.commit()
+
+            detail = _chat_fetch_thread_detail(conn, thread_id)
+            if detail is None:
+                raise HTTPException(status_code=404, detail=f"Chat thread not found: {thread_id}")
+            return detail
+        finally:
+            conn.close()
+
+
 @app.post("/search", response_model=SearchResponse)
 def search(req: SearchRequest) -> SearchResponse:
     _sync_runtime_settings_from_store()
@@ -2481,6 +3369,145 @@ def search(req: SearchRequest) -> SearchResponse:
         result_count=len(out.results),
         results=out.results,
     )
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed != parsed:  # NaN
+        return None
+    return parsed
+
+
+def _extract_query_variants(rows: list[dict[str, Any]]) -> list[str]:
+    for row in rows:
+        score_detail = row.get("score_detail")
+        if not isinstance(score_detail, dict):
+            continue
+        raw = score_detail.get("query_variants")
+        if not isinstance(raw, list):
+            continue
+        variants: list[str] = []
+        for item in raw:
+            value = str(item or "").strip()
+            if value:
+                variants.append(value)
+        if variants:
+            return variants
+    return []
+
+
+def _extract_reranker_model(rows: list[dict[str, Any]]) -> str:
+    for row in rows:
+        score_detail = row.get("score_detail")
+        if not isinstance(score_detail, dict):
+            continue
+        model = str(score_detail.get("reranker_model") or "").strip()
+        if model:
+            return model
+    return ""
+
+
+def _build_answer_tool_events(
+    req: AnswerRequest,
+    *,
+    selected_doc_ids: list[str],
+    retrieval_results: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    answer_text: str,
+) -> list[dict[str, Any]]:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    by_source: dict[str, int] = {}
+    by_chunk_type: dict[str, int] = {}
+    top_hits: list[dict[str, Any]] = []
+    for index, row in enumerate(retrieval_results):
+        source = str(row.get("source") or "").strip() or "unknown"
+        chunk_type = str(row.get("chunk_type") or "text").strip() or "text"
+        by_source[source] = by_source.get(source, 0) + 1
+        by_chunk_type[chunk_type] = by_chunk_type.get(chunk_type, 0) + 1
+        if index < 8:
+            top_hits.append(
+                {
+                    "rank": index + 1,
+                    "doc_id": str(row.get("doc_id") or ""),
+                    "source_name": str(row.get("source_name") or row.get("doc_id") or ""),
+                    "heading_path": str(row.get("heading_path") or ""),
+                    "chunk_type": chunk_type,
+                    "page": row.get("page"),
+                    "final_score": _to_float_or_none(row.get("final_score")),
+                    "rerank_score": _to_float_or_none(row.get("rerank_score")),
+                    "rrf_score": _to_float_or_none(row.get("rrf_score")),
+                }
+            )
+
+    query_variants = _extract_query_variants(retrieval_results)
+    reranker_model = _extract_reranker_model(retrieval_results)
+    citations_preview: list[dict[str, Any]] = []
+    for item in sources[:12]:
+        citations_preview.append(
+            {
+                "index": int(item.get("index") or 0),
+                "doc_id": str(item.get("doc_id") or ""),
+                "source_name": str(item.get("source_name") or ""),
+                "heading_path": str(item.get("heading_path") or ""),
+                "source_type": str(item.get("source_type") or ""),
+            }
+        )
+
+    return [
+        {
+            "stage": "retrieval",
+            "detail": "Hybrid retrieval completed.",
+            "tool_name": "search_documents",
+            "parameters": {
+                "question": req.question,
+                "collection_name": req.collection_name,
+                "doc_language": req.doc_language,
+                "top_k": req.top_k,
+                "selected_doc_ids": selected_doc_ids,
+            },
+            "result": {
+                "result_count": len(retrieval_results),
+                "query_variant_count": len(query_variants),
+                "query_variants": query_variants,
+                "reranker_model": reranker_model,
+                "by_source": by_source,
+                "by_chunk_type": by_chunk_type,
+                "top_hits": top_hits,
+            },
+            "at": now_ms,
+        },
+        {
+            "stage": "citation",
+            "detail": "Citations normalized.",
+            "tool_name": "build_citations",
+            "parameters": {
+                "retrieval_result_count": len(retrieval_results),
+                "source_record_count": len(sources),
+            },
+            "result": {
+                "citation_count": len(sources),
+                "citations_preview": citations_preview,
+            },
+            "at": now_ms + 1,
+        },
+        {
+            "stage": "generation",
+            "detail": "Answer generated.",
+            "tool_name": "generate_answer",
+            "parameters": {
+                "model": str(os.environ.get("LLM_MODEL") or "gpt-4o"),
+                "context_chunk_count": len(retrieval_results),
+            },
+            "result": {
+                "answer_char_count": len(answer_text),
+                "answer_preview": answer_text[:280],
+            },
+            "at": now_ms + 2,
+        },
+    ]
 
 
 @app.post("/answer", response_model=AnswerResponse)
@@ -2557,9 +3584,20 @@ def answer(req: AnswerRequest) -> AnswerResponse:
                 item["source_name"] = str(ref.get("source_name"))
             normalized_sources.append(item)
 
+    final_question = str(out.get("question", req.question) or req.question)
+    final_answer = str(out.get("answer", "") or "")
+    tool_events = _build_answer_tool_events(
+        req,
+        selected_doc_ids=selected_doc_ids,
+        retrieval_results=normalized_results,
+        sources=normalized_sources,
+        answer_text=final_answer,
+    )
+
     return AnswerResponse(
-        question=out.get("question", req.question),
-        answer=out.get("answer", ""),
+        question=final_question,
+        answer=final_answer,
         sources=normalized_sources,
         retrieval_results=normalized_results,
+        tool_events=tool_events,
     )
